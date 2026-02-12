@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-SpiderWeb 🕸️ - Advanced CLI IP Analysis Tool
+SpiderWeb - Advanced CLI IP Analysis Tool (Professional Edition)
 Author: g33l0
-Version: 6.0
-Description: Professional, secure, and efficient IP reconnaissance framework
+Version: 7.0
+Description: Professional IP reconnaissance with advanced liveness detection
 """
 
 import requests
@@ -21,679 +21,267 @@ from urllib.parse import quote, urlparse
 from collections import defaultdict
 import sys
 import os
-import dns.resolver
 from pathlib import Path
 import random
-import hashlib
-from threading import Lock
+import threading
+import signal
+import asyncio
+import aiohttp
+from queue import Queue
 
-# Color codes for CLI
+# ANSI Color codes
 class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
+    GREEN = '\033[92m'      # Hacker green
+    RED = '\033[91m'        # Red
+    WHITE = '\033[97m'      # White
+    CYAN = '\033[96m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
+
+
+class NavigationException(Exception):
+    """Exception for navigation control"""
+    pass
+
+
+class ExitException(Exception):
+    """Exception for exit control"""
+    pass
+
+
+@dataclass
+class DomainAttribution:
+    """Domain attribution data"""
+    reverse_dns: Optional[str] = None
+    tls_san_domains: List[str] = field(default_factory=list)
+    ct_log_domains: List[str] = field(default_factory=list)
+    passive_dns_domains: List[str] = field(default_factory=list)
+    all_domains: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LivenessStatus:
+    """Advanced liveness detection result"""
+    status: str = "dead"  # alive, tls_only, filtered, dead
+    tcp_responsive: bool = False
+    http_responsive: bool = False
+    https_responsive: bool = False
+    tls_handshake: bool = False
+    http_status: Optional[int] = None
+    https_status: Optional[int] = None
+    response_time: Optional[float] = None
+
+
+@dataclass
+class HostingClassification:
+    """Hosting type classification"""
+    hosting_type: str = "unknown"  # cdn, shared, vps, dedicated, load_balancer
+    provider: Optional[str] = None
+    confidence: float = 0.0
+    is_origin: bool = False
+
 
 @dataclass
 class IPAnalysisResult:
     """Complete IP analysis result"""
     ip: str
-    is_live: bool = False
     
-    # Liveness metrics
-    ping_responsive: bool = False
-    http_status: Optional[int] = None
-    https_status: Optional[int] = None
-    response_time: Optional[float] = None
+    # Liveness
+    liveness: LivenessStatus = field(default_factory=LivenessStatus)
+    
+    # Domain Attribution
+    domains: DomainAttribution = field(default_factory=DomainAttribution)
+    
+    # Hosting Classification
+    hosting: HostingClassification = field(default_factory=HostingClassification)
+    
+    # Network Info
     tcp_ports_open: List[int] = field(default_factory=list)
-    
-    # DNS Information
-    reverse_dns: Optional[str] = None
-    ptr_records: List[str] = field(default_factory=list)
-    
-    # SSL/TLS
-    ssl_valid: Optional[bool] = None
-    ssl_issuer: Optional[str] = None
-    ssl_expiry: Optional[str] = None
+    asn: Optional[str] = None
+    asn_org: Optional[str] = None
     
     # Geolocation
     country: Optional[str] = None
     country_name: Optional[str] = None
     city: Optional[str] = None
-    region: Optional[str] = None
     isp: Optional[str] = None
-    organization: Optional[str] = None
-    asn: Optional[str] = None
     
-    # Web information
+    # SSL/TLS
+    ssl_valid: bool = False
+    ssl_issuer: Optional[str] = None
+    ssl_subject: Optional[str] = None
+    
+    # Web
     web_server: Optional[str] = None
     web_title: Optional[str] = None
-    detected_technologies: List[str] = field(default_factory=list)
     
-    # Security
-    security_headers: Dict[str, str] = field(default_factory=dict)
+    # CDN Detection
+    is_cdn: bool = False
+    cdn_provider: Optional[str] = None
+    bypass_methods: List[str] = field(default_factory=list)
     
     # Metadata
     scan_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    source_keyword: Optional[str] = None
-    
-    def __post_init__(self):
-        if not self.scan_timestamp:
-            self.scan_timestamp = datetime.now().isoformat()
+    source_keywords: List[str] = field(default_factory=list)
+    target_country: Optional[str] = None
+    confidence_score: float = 0.0
 
 
-class RateLimiter:
-    """Adaptive rate limiter with jitter"""
+class ASNCache:
+    """Thread-safe ASN cache"""
+    def __init__(self):
+        self.cache = {}
+        self.lock = threading.Lock()
     
-    def __init__(self, requests_per_second: float = 5.0):
-        self.requests_per_second = requests_per_second
-        self.min_interval = 1.0 / requests_per_second
-        self.last_request_time = 0
-        self.lock = Lock()
-    
-    def wait(self):
-        """Wait with randomized jitter to avoid patterns"""
+    def get(self, ip: str) -> Optional[Dict]:
         with self.lock:
-            current_time = time.time()
-            elapsed = current_time - self.last_request_time
-            
-            if elapsed < self.min_interval:
-                # Add jitter (±20% randomization)
-                jitter = random.uniform(0.8, 1.2)
-                sleep_time = (self.min_interval - elapsed) * jitter
-                time.sleep(sleep_time)
-            
-            self.last_request_time = time.time()
-
-
-class IPGenerator:
-    """Intelligent IP generation with multiple sources and retry logic"""
+            return self.cache.get(ip)
     
-    def __init__(self, rate_limiter: RateLimiter):
+    def set(self, ip: str, data: Dict):
+        with self.lock:
+            self.cache[ip] = data
+
+
+class CDNDetector:
+    """Enhanced CDN/hosting detection"""
+    
+    CDN_ASN = {
+        'Cloudflare': ['AS13335', 'AS209242'],
+        'Akamai': ['AS16625', 'AS20940', 'AS21342', 'AS21357', 'AS34164'],
+        'Fastly': ['AS54113'],
+        'CloudFront': ['AS16509', 'AS14618'],
+        'StackPath': ['AS33438'],
+        'Incapsula': ['AS19551'],
+        'Sucuri': ['AS30148'],
+        'KeyCDN': ['AS30633'],
+    }
+    
+    SHARED_HOSTING = {
+        'GoDaddy': ['AS26496'],
+        'HostGator': ['AS46606'],
+        'Bluehost': ['AS46606'],
+        'SiteGround': ['AS54290'],
+        'Namecheap': ['AS22612'],
+    }
+    
+    CLOUD_PROVIDERS = {
+        'AWS': ['AS16509', 'AS14618'],
+        'Google Cloud': ['AS15169'],
+        'Azure': ['AS8075'],
+        'DigitalOcean': ['AS14061'],
+        'Linode': ['AS63949'],
+        'Vultr': ['AS20473'],
+        'OVH': ['AS16276'],
+    }
+    
+    @staticmethod
+    def classify_hosting(asn: str, asn_org: str, headers: Dict = None) -> HostingClassification:
+        """Classify hosting type with confidence score"""
+        classification = HostingClassification()
+        
+        # Check CDN
+        for provider, asn_list in CDNDetector.CDN_ASN.items():
+            if any(asn_num in asn for asn_num in asn_list):
+                classification.hosting_type = "cdn"
+                classification.provider = provider
+                classification.confidence = 0.95
+                classification.is_origin = False
+                return classification
+        
+        # Check headers for CDN
+        if headers:
+            if 'CF-RAY' in headers:
+                classification.hosting_type = "cdn"
+                classification.provider = "Cloudflare"
+                classification.confidence = 1.0
+                classification.is_origin = False
+                return classification
+            
+            if 'X-Akamai-Request-ID' in headers:
+                classification.hosting_type = "cdn"
+                classification.provider = "Akamai"
+                classification.confidence = 1.0
+                classification.is_origin = False
+                return classification
+        
+        # Check shared hosting
+        for provider, asn_list in CDNDetector.SHARED_HOSTING.items():
+            if any(asn_num in asn for asn_num in asn_list):
+                classification.hosting_type = "shared"
+                classification.provider = provider
+                classification.confidence = 0.85
+                classification.is_origin = True
+                return classification
+        
+        # Check cloud providers
+        for provider, asn_list in CDNDetector.CLOUD_PROVIDERS.items():
+            if any(asn_num in asn for asn_num in asn_list):
+                classification.hosting_type = "cloud"
+                classification.provider = provider
+                classification.confidence = 0.75
+                classification.is_origin = True
+                return classification
+        
+        # Default to VPS/Dedicated
+        classification.hosting_type = "vps_dedicated"
+        classification.confidence = 0.6
+        classification.is_origin = True
+        
+        return classification
+
+
+class AdvancedScanner:
+    """Advanced IP scanner with async capabilities"""
+    
+    def __init__(self, rate_limiter):
         self.rate_limiter = rate_limiter
+        self.asn_cache = ASNCache()
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-        self.dns_resolver = dns.resolver.Resolver()
-        self.dns_resolver.timeout = 5
-        self.dns_resolver.lifetime = 5
     
-    def generate_ips(self, keyword: str, count: int, max_retries: int = 3) -> Tuple[Set[str], Dict[str, int]]:
-        """
-        Generate IPs with retry logic and multiple sources
+    def advanced_liveness_check(self, ip: str) -> LivenessStatus:
+        """Advanced multi-layer liveness detection"""
+        status = LivenessStatus()
         
-        Returns:
-            Tuple of (unique_ips, source_stats)
-        """
-        ips = set()
-        source_stats = defaultdict(int)
-        
-        print(f"\n{Colors.OKCYAN}🔍 Generating {count} IPs for keyword: '{keyword}'{Colors.ENDC}\n")
-        
-        # Strategy 1: Direct DNS resolution (fast, reliable)
-        print(f"{Colors.OKBLUE}[1/5] Trying direct DNS resolution...{Colors.ENDC}")
-        dns_ips = self._dns_resolution(keyword, count)
-        ips.update(dns_ips)
-        source_stats['dns'] = len(dns_ips)
-        print(f"      ✓ Found {len(dns_ips)} IPs via DNS")
-        
-        if len(ips) >= count:
-            return ips, dict(source_stats)
-        
-        # Strategy 2: URLScan.io (web crawling database)
-        print(f"{Colors.OKBLUE}[2/5] Querying URLScan.io...{Colors.ENDC}")
-        urlscan_ips = self._query_urlscan(keyword, count - len(ips))
-        new_ips = urlscan_ips - ips
-        ips.update(new_ips)
-        source_stats['urlscan'] = len(new_ips)
-        print(f"      ✓ Found {len(new_ips)} new IPs from URLScan.io")
-        
-        if len(ips) >= count:
-            return ips, dict(source_stats)
-        
-        # Strategy 3: ThreatCrowd (threat intelligence)
-        print(f"{Colors.OKBLUE}[3/5] Querying ThreatCrowd...{Colors.ENDC}")
-        threat_ips = self._query_threatcrowd(keyword, count - len(ips))
-        new_ips = threat_ips - ips
-        ips.update(new_ips)
-        source_stats['threatcrowd'] = len(new_ips)
-        print(f"      ✓ Found {len(new_ips)} new IPs from ThreatCrowd")
-        
-        if len(ips) >= count:
-            return ips, dict(source_stats)
-        
-        # Strategy 4: Certificate Transparency (crt.sh)
-        print(f"{Colors.OKBLUE}[4/5] Checking Certificate Transparency logs...{Colors.ENDC}")
-        crt_ips = self._query_crtsh(keyword, count - len(ips))
-        new_ips = crt_ips - ips
-        ips.update(new_ips)
-        source_stats['crtsh'] = len(new_ips)
-        print(f"      ✓ Found {len(new_ips)} new IPs from crt.sh")
-        
-        if len(ips) >= count:
-            return ips, dict(source_stats)
-        
-        # Strategy 5: Expand search with variants
-        print(f"{Colors.OKBLUE}[5/5] Trying keyword variations...{Colors.ENDC}")
-        variant_ips = self._expand_keyword_search(keyword, count - len(ips))
-        new_ips = variant_ips - ips
-        ips.update(new_ips)
-        source_stats['variants'] = len(new_ips)
-        print(f"      ✓ Found {len(new_ips)} new IPs from variants")
-        
-        # Retry logic if still insufficient
-        attempt = 1
-        while len(ips) < count and attempt <= max_retries:
-            print(f"\n{Colors.WARNING}⚠️  Only {len(ips)}/{count} IPs found. Retry attempt {attempt}/{max_retries}...{Colors.ENDC}")
-            
-            # Retry with more aggressive pagination
-            retry_ips = self._retry_with_pagination(keyword, count - len(ips))
-            new_ips = retry_ips - ips
-            ips.update(new_ips)
-            source_stats['retry'] = source_stats.get('retry', 0) + len(new_ips)
-            print(f"      ✓ Found {len(new_ips)} additional IPs")
-            
-            if len(ips) >= count:
+        # Layer 1: TCP handshake on common ports
+        for port in [80, 443]:
+            if self._tcp_handshake(ip, port):
+                status.tcp_responsive = True
                 break
-            
-            attempt += 1
-            time.sleep(1)
         
-        return ips, dict(source_stats)
+        if not status.tcp_responsive:
+            status.status = "dead"
+            return status
+        
+        # Layer 2: HTTP/HTTPS check
+        http_ok, http_code, http_time = self._http_check(ip)
+        https_ok, https_code, https_time, tls_ok = self._https_check_with_tls(ip)
+        
+        status.http_responsive = http_ok
+        status.https_responsive = https_ok
+        status.tls_handshake = tls_ok
+        status.http_status = http_code
+        status.https_status = https_code
+        status.response_time = https_time or http_time
+        
+        # Classification
+        if http_ok or https_ok:
+            status.status = "alive"
+        elif tls_ok:
+            status.status = "tls_only"
+        elif status.tcp_responsive:
+            status.status = "filtered"
+        else:
+            status.status = "dead"
+        
+        return status
     
-    def _dns_resolution(self, keyword: str, limit: int) -> Set[str]:
-        """DNS resolution with common patterns"""
-        ips = set()
-        
-        # Generate domain patterns
-        patterns = [
-            keyword,
-            f"{keyword}.com",
-            f"{keyword}.net",
-            f"{keyword}.org",
-            f"www.{keyword}",
-            f"www.{keyword}.com",
-            f"www.{keyword}.net",
-            f"api.{keyword}",
-            f"mail.{keyword}",
-            f"mail.{keyword}.com",
-            f"smtp.{keyword}.com",
-            f"imap.{keyword}.com",
-            f"mx.{keyword}.com",
-            f"ftp.{keyword}.com",
-            f"sftp.{keyword}.com",
-            f"files.{keyword}.com",
-            f"api.{keyword}.com",
-            f"app.{keyword}.com",
-            f"web.{keyword}.com",
-            f"portal.{keyword}.com",
-            f"service.{keyword}.com",
-            f"admin.{keyword}.com",
-            f"panel.{keyword}.com",
-            f"dashboard.{keyword}.com",
-            f"manage.{keyword}.com",
-            f"console.{keyword}.com",
-            f"auth.{keyword}.com", 
-            f"login.{keyword}.com", 
-            f"sso.{keyword}.com", 
-            f"secure.{keyword}.com", 
-            f"vpn.{keyword}.com",
-            f"gw.{keyword}.com",
-            f"gateway.{keyword}.com",
-            f"edge.{keyword}.com",
-            f"router.{keyword}.com",
-            f"lb.{keyword}.com",
-            f"loadbalancer.{keyword}.com",
-            f"dev.{keyword}.com",
-            f"test.{keyword}.com",
-            f"staging.{keyword}.com",
-            f"stage.{keyword}.com",
-            f"qa.{keyword}.com",
-            f"uat.{keyword}.com",
-            f"v1.{keyword}.com",
-            f"v2.{keyword}.com",
-            f"old.{keyword}.com",
-            f"legacy.{keyword}.com",
-            f"backup.{keyword}.com",
-            f"node.{keyword}.com",
-            f"nodes.{keyword}.com",
-            f"cluster.{keyword}.com",
-            f"docker.{keyword}.com",
-            f"k8s.{keyword}.com",
-            f"status.{keyword}.com",
-            f"monitor.{keyword}.com",
-            f"health.{keyword}.com",
-            f"server.{keyword}.com",
-            f"srv.{keyword}.com",
-            f"host.{keyword}.com",
-            f"host1.{keyword}.com",
-            f"host2.{keyword}.com",
-            f"ip.{keyword}.com",
-            f"{keyword}.io",
-            f"{keyword}.co",
-            
-        ]
-        
-        prefixes = ["api", "admin", "dev", "test", "stage", "vpn", "gw", "edge"]
-        suffixes = ["1", "2", "01", "prod", "int"]
-
-        patterns.extend(
-        [f"{p}-{keyword}.com" for p in prefixes] +
-        [f"{p}.{keyword}{s}.com" for p in prefixes for s in suffixes]
-        )
-
-        for pattern in patterns:
-            if len(ips) >= limit:
-                break
-            
-            try:
-                ip = socket.gethostbyname(pattern)
-                if self._is_valid_ip(ip) and not self._is_private_ip(ip):
-                    ips.add(ip)
-                self.rate_limiter.wait()
-            except:
-                pass
-        
-        return ips
-    
-    def _query_urlscan(self, keyword: str, limit: int) -> Set[str]:
-        """Query URLScan.io with pagination"""
-        ips = set()
-        
-        try:
-            url = "https://urlscan.io/api/v1/search/"
-            params = {'q': keyword, 'size': min(limit * 2, 100)}
-            
-            self.rate_limiter.wait()
-            response = self.session.get(url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for result in data.get('results', []):
-                    if len(ips) >= limit:
-                        break
-                    
-                    page = result.get('page', {})
-                    ip = page.get('ip', '')
-                    
-                    if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
-                        ips.add(ip)
-        except:
-            pass
-        
-        return ips
-    
-    def _query_threatcrowd(self, keyword: str, limit: int) -> Set[str]:
-        """Query ThreatCrowd API"""
-        ips = set()
-        
-        try:
-            # Try as domain
-            url = f"https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={keyword}"
-            
-            self.rate_limiter.wait()
-            response = self.session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('response_code') == '1':
-                    for resolution in data.get('resolutions', []):
-                        if len(ips) >= limit:
-                            break
-                        
-                        ip = resolution.get('ip_address', '')
-                        if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
-                            ips.add(ip)
-        except:
-            pass
-        
-        return ips
-    
-    def _query_crtsh(self, keyword: str, limit: int) -> Set[str]:
-        """Query Certificate Transparency logs"""
-        ips = set()
-        
-        try:
-            url = "https://crt.sh/"
-            params = {'q': f'%.{keyword}%', 'output': 'json'}
-            
-            self.rate_limiter.wait()
-            response = self.session.get(url, params=params, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                domains = set()
-                
-                for entry in data[:limit * 2]:
-                    name_value = entry.get('name_value', '')
-                    for domain in name_value.split('\n'):
-                        domain = domain.strip().lower().replace('*.', '')
-                        if domain and len(domains) < limit * 2:
-                            domains.add(domain)
-                
-                # Resolve domains to IPs
-                for domain in list(domains)[:limit]:
-                    if len(ips) >= limit:
-                        break
-                    
-                    try:
-                        ip = socket.gethostbyname(domain)
-                        if self._is_valid_ip(ip) and not self._is_private_ip(ip):
-                            ips.add(ip)
-                        self.rate_limiter.wait()
-                    except:
-                        pass
-        except:
-            pass
-        
-        return ips
-    
-    def _expand_keyword_search(self, keyword: str, limit: int) -> Set[str]:
-        """Expand search with keyword variations"""
-        ips = set()
-        
-        # Generate variations
-        variations = [
-            f"{keyword}s",
-            f"{keyword}-app",
-            f"{keyword}-api",
-            f"{keyword}-web",
-            f"my{keyword}",
-            f"get{keyword}",
-            f"{keyword}online",
-            f"{keyword}cloud",
-        ]
-        
-        for variant in variations:
-            if len(ips) >= limit:
-                break
-            
-            # Try DNS resolution
-            try:
-                ip = socket.gethostbyname(f"{variant}.com")
-                if self._is_valid_ip(ip) and not self._is_private_ip(ip):
-                    ips.add(ip)
-                self.rate_limiter.wait()
-            except:
-                pass
-        
-        return ips
-    
-    def _retry_with_pagination(self, keyword: str, limit: int) -> Set[str]:
-        """Retry with different pagination parameters"""
-        ips = set()
-        
-        # Try URLScan with different queries
-        queries = [
-            f"domain:{keyword}",
-            f"page.domain:{keyword}",
-            f"task.domain:{keyword}",
-        ]
-        
-        for query in queries:
-            if len(ips) >= limit:
-                break
-            
-            try:
-                url = "https://urlscan.io/api/v1/search/"
-                params = {'q': query, 'size': 50}
-                
-                self.rate_limiter.wait()
-                response = self.session.get(url, params=params, timeout=10)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    for result in data.get('results', []):
-                        if len(ips) >= limit:
-                            break
-                        
-                        page = result.get('page', {})
-                        ip = page.get('ip', '')
-                        
-                        if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
-                            ips.add(ip)
-            except:
-                pass
-        
-        return ips
-    
-    def _is_valid_ip(self, ip: str) -> bool:
-        """Validate IPv4 address"""
-        pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-        if re.match(pattern, ip):
-            parts = ip.split('.')
-            return all(0 <= int(part) <= 255 for part in parts)
-        return False
-    
-    def _is_private_ip(self, ip: str) -> bool:
-        """Check if IP is private/reserved"""
-        try:
-            parts = [int(p) for p in ip.split('.')]
-            
-            # Private ranges
-            if parts[0] == 10:
-                return True
-            if parts[0] == 172 and 16 <= parts[1] <= 31:
-                return True
-            if parts[0] == 192 and parts[1] == 168:
-                return True
-            if parts[0] == 127:  # Loopback
-                return True
-            if parts[0] == 0:  # Invalid
-                return True
-            
-            return False
-        except:
-            return True
-
-
-class SpiderWebCLI:
-    """
-    SpiderWeb 🕸️ - Professional CLI IP Analysis Tool
-    """
-    
-    VERSION = "6.0"
-    BANNER = f"""
-{Colors.OKCYAN}
-╔═══════════════════════════════════════════════════════════╗
-║                                                           ║
-║                ╔═╗┌─┐┬┌┬┐┌─┐┬─┐╦ ╦┌─┐┌┐                   ║
-║                ╚═╗├─┘│ ││├┤ ├┬┘║║║├┤ ├┴┐                  ║
-║                ╚═╝┴  ┴─┴┘└─┘┴└─╚╩╝└─┘└─┘                  ║
-║                           🕸️                               ║
-║             Professional IP Analysis Tool v{VERSION}            ║
-║                        by g33l0                           ║
-║                                                           ║
-║ ┌───────────────────────────────────────────────────────┐ ║
-║ │     Scan   |   Analyze   |   Report   |    Secure     │ ║
-║ └───────────────────────────────────────────────────────┘ ║
-╚═══════════════════════════════════════════════════════════╝{Colors.ENDC}
-"""
-    
-    COMMON_PORTS = [80, 443, 22, 25, 3389, 3306, 5432, 27017, 6379, 445, 9200, 8443, 8000, 8080]  # Reduced for stealth
-    MAX_IPS = 4000
-    
-    def __init__(self, verbose: bool = True, requests_per_second: float = 5.0):
-        self.verbose = verbose
-        self.rate_limiter = RateLimiter(requests_per_second)
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.results: List[IPAnalysisResult] = []
-        self.dns_resolver = dns.resolver.Resolver()
-        self.dns_resolver.timeout = 5
-        self.dns_resolver.lifetime = 5
-        self.ip_generator = IPGenerator(self.rate_limiter)
-    
-    def print_banner(self):
-        """Display banner"""
-        print(self.BANNER)
-    
-    def log(self, message: str, level: str = "INFO"):
-        """Colored logging"""
-        if not self.verbose:
-            return
-        
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        levels = {
-            "INFO": (Colors.OKBLUE, "ℹ️ "),
-            "SUCCESS": (Colors.OKGREEN, "✅"),
-            "ERROR": (Colors.FAIL, "❌"),
-            "WARNING": (Colors.WARNING, "⚠️ "),
-            "SCAN": (Colors.OKCYAN, "🔍"),
-            "LIVE": (Colors.OKGREEN, "🟢"),
-            "DEAD": (Colors.FAIL, "🔴"),
-        }
-        
-        color, symbol = levels.get(level, (Colors.ENDC, ""))
-        print(f"{color}{symbol} [{timestamp}] {message}{Colors.ENDC}")
-    
-    def prompt_input_method(self) -> str:
-        """Prompt user to select input method"""
-        print(f"\n{Colors.BOLD}═══ SELECT INPUT METHOD ═══{Colors.ENDC}\n")
-        print(f"{Colors.OKCYAN}1.{Colors.ENDC} Keyword-based IP generation")
-        print(f"{Colors.OKCYAN}2.{Colors.ENDC} Scan IPs from file (ips.txt)")
-        
-        while True:
-            try:
-                choice = input(f"\n{Colors.BOLD}Enter your choice (1 or 2): {Colors.ENDC}").strip()
-                
-                if choice == "1":
-                    return "keyword"
-                elif choice == "2":
-                    return "file"
-                else:
-                    print(f"{Colors.FAIL}❌ Invalid choice. Please enter 1 or 2.{Colors.ENDC}")
-            except KeyboardInterrupt:
-                print(f"\n{Colors.WARNING}⚠️  Operation cancelled by user.{Colors.ENDC}")
-                sys.exit(0)
-    
-    def get_keyword_input(self) -> Tuple[str, int]:
-        """Get keyword and IP count from user"""
-        print(f"\n{Colors.BOLD}═══ KEYWORD-BASED IP GENERATION ═══{Colors.ENDC}\n")
-        
-        # Get keyword
-        while True:
-            try:
-                keyword = input(f"{Colors.BOLD}Enter keyword for IP generation: {Colors.ENDC}").strip()
-                
-                if not keyword:
-                    print(f"{Colors.FAIL}❌ Keyword cannot be empty.{Colors.ENDC}")
-                    continue
-                
-                if len(keyword) < 2:
-                    print(f"{Colors.FAIL}❌ Keyword must be at least 2 characters.{Colors.ENDC}")
-                    continue
-                
-                break
-            except KeyboardInterrupt:
-                print(f"\n{Colors.WARNING}⚠️  Operation cancelled by user.{Colors.ENDC}")
-                sys.exit(0)
-        
-        # Get IP count
-        while True:
-            try:
-                count_input = input(f"{Colors.BOLD}How many IPs to generate? (max {self.MAX_IPS}): {Colors.ENDC}").strip()
-                
-                if not count_input:
-                    print(f"{Colors.FAIL}❌ Please enter a number.{Colors.ENDC}")
-                    continue
-                
-                count = int(count_input)
-                
-                if count <= 0:
-                    print(f"{Colors.FAIL}❌ Count must be greater than 0.{Colors.ENDC}")
-                    continue
-                
-                if count > self.MAX_IPS:
-                    print(f"{Colors.FAIL}❌ Maximum allowed is {self.MAX_IPS} IPs.{Colors.ENDC}")
-                    continue
-                
-                return keyword, count
-            
-            except ValueError:
-                print(f"{Colors.FAIL}❌ Invalid number. Please enter a valid integer.{Colors.ENDC}")
-            except KeyboardInterrupt:
-                print(f"\n{Colors.WARNING}⚠️  Operation cancelled by user.{Colors.ENDC}")
-                sys.exit(0)
-    
-    def read_ips_from_file(self, filename: str = "ips.txt") -> List[str]:
-        """Read IPs from file"""
-        filepath = Path(filename)
-        
-        if not filepath.exists():
-            self.log(f"File '{filename}' not found in current directory", "ERROR")
-            self.log(f"Current directory: {os.getcwd()}", "INFO")
-            sys.exit(1)
-        
-        try:
-            with open(filepath, 'r') as f:
-                lines = f.readlines()
-            
-            ips = []
-            for line_num, line in enumerate(lines, 1):
-                ip = line.strip()
-                
-                # Skip empty lines and comments
-                if not ip or ip.startswith('#'):
-                    continue
-                
-                # Validate IP format
-                if self.is_valid_ip(ip):
-                    ips.append(ip)
-                else:
-                    self.log(f"Invalid IP on line {line_num}: {ip}", "WARNING")
-            
-            if not ips:
-                self.log(f"No valid IPs found in {filename}", "ERROR")
-                sys.exit(1)
-            
-            if len(ips) > self.MAX_IPS:
-                self.log(f"File contains {len(ips)} IPs, limiting to {self.MAX_IPS}", "WARNING")
-                ips = ips[:self.MAX_IPS]
-            
-            # Deduplicate
-            unique_ips = list(set(ips))
-            if len(unique_ips) < len(ips):
-                self.log(f"Removed {len(ips) - len(unique_ips)} duplicate IPs", "INFO")
-            
-            self.log(f"Successfully loaded {len(unique_ips)} unique IPs from {filename}", "SUCCESS")
-            return unique_ips
-        
-        except Exception as e:
-            self.log(f"Error reading file: {str(e)}", "ERROR")
-            sys.exit(1)
-    
-    def is_valid_ip(self, ip: str) -> bool:
-        """Validate IPv4 address"""
-        pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-        if re.match(pattern, ip):
-            parts = ip.split('.')
-            return all(0 <= int(part) <= 255 for part in parts)
-        return False
-    
-    def check_liveness_lightweight(self, ip: str) -> bool:
-        """Lightweight liveness check (TCP connect only)"""
-        # Try HTTP first (most common)
-        if self.check_tcp_port(ip, 80, timeout=1):
-            return True
-        
-        # Try HTTPS
-        if self.check_tcp_port(ip, 443, timeout=1):
-            return True
-        
-        return False
-    
-    def check_tcp_port(self, ip: str, port: int, timeout: int = 2) -> bool:
-        """Check if TCP port is open"""
+    def _tcp_handshake(self, ip: str, port: int, timeout: int = 3) -> bool:
+        """Perform TCP handshake"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -703,165 +291,259 @@ class SpiderWebCLI:
         except:
             return False
     
-    def check_http_status(self, ip: str) -> Tuple[Optional[int], Optional[int], Optional[float]]:
-        """Check HTTP/HTTPS status with HEAD request (lightweight)"""
-        http_status = None
-        https_status = None
-        response_time = None
+    def _http_check(self, ip: str) -> Tuple[bool, Optional[int], Optional[float]]:
+        """HTTP check"""
+        try:
+            start = time.time()
+            response = self.session.head(f"http://{ip}", timeout=5, allow_redirects=True)
+            elapsed = time.time() - start
+            return True, response.status_code, elapsed
+        except:
+            return False, None, None
+    
+    def _https_check_with_tls(self, ip: str) -> Tuple[bool, Optional[int], Optional[float], bool]:
+        """HTTPS check with TLS handshake and SNI"""
+        tls_ok = False
         
-        # Try HTTPS first (more common now)
+        # Try TLS handshake with SNI
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((ip, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=ip) as ssock:
+                    tls_ok = True
+        except:
+            pass
+        
+        # Try HTTPS request
         try:
             start = time.time()
             response = self.session.head(f"https://{ip}", timeout=5, verify=False, allow_redirects=True)
-            response_time = time.time() - start
-            https_status = response.status_code
+            elapsed = time.time() - start
+            return True, response.status_code, elapsed, tls_ok
         except:
-            pass
-        
-        # Try HTTP if HTTPS failed
-        if https_status is None:
-            try:
-                start = time.time()
-                response = self.session.head(f"http://{ip}", timeout=5, allow_redirects=True)
-                response_time = time.time() - start
-                http_status = response.status_code
-            except:
-                pass
-        
-        return http_status, https_status, response_time
+            return False, None, None, tls_ok
     
-    def comprehensive_scan(self, ip: str, keyword: Optional[str] = None) -> IPAnalysisResult:
-        """Perform comprehensive IP analysis"""
-        result = IPAnalysisResult(ip=ip, source_keyword=keyword)
-        
-        # Phase 1: Quick liveness check
-        is_live = self.check_liveness_lightweight(ip)
-        result.is_live = is_live
-        
-        if not is_live:
-            return result
-        
-        # Phase 2: Detailed analysis for live IPs only
-        self.rate_limiter.wait()
-        
-        # Check specific ports
-        open_ports = []
-        for port in self.COMMON_PORTS:
-            if self.check_tcp_port(ip, port, timeout=2):
-                open_ports.append(port)
-            self.rate_limiter.wait()
-        
-        result.tcp_ports_open = open_ports
-        
-        # HTTP/HTTPS check
-        http_status, https_status, response_time = self.check_http_status(ip)
-        result.http_status = http_status
-        result.https_status = https_status
-        result.response_time = response_time
+    def get_domain_attribution(self, ip: str) -> DomainAttribution:
+        """Get all associated domains"""
+        domains = DomainAttribution()
+        all_found = set()
         
         # Reverse DNS
         try:
-            result.reverse_dns = socket.gethostbyaddr(ip)[0]
+            reverse = socket.gethostbyaddr(ip)[0]
+            domains.reverse_dns = reverse
+            all_found.add(reverse)
         except:
             pass
         
-        # Geolocation (rate-limited)
-        self.rate_limiter.wait()
-        geo_info = self.get_geolocation(ip)
-        result.country = geo_info.get('country')
-        result.country_name = geo_info.get('country_name')
-        result.city = geo_info.get('city')
-        result.region = geo_info.get('region')
-        result.isp = geo_info.get('isp')
-        result.organization = geo_info.get('organization')
-        result.asn = geo_info.get('asn')
-        
-        # Web analysis (if applicable)
-        if result.http_status or result.https_status:
-            web_info = self.analyze_web_server(ip)
-            result.web_server = web_info.get('server')
-            result.web_title = web_info.get('title')
-            result.detected_technologies = web_info.get('technologies', [])
-            result.security_headers = web_info.get('security_headers', {})
-            
-            # SSL check
-            if result.https_status:
-                ssl_info = self.check_ssl(ip)
-                result.ssl_valid = ssl_info.get('valid')
-                result.ssl_issuer = ssl_info.get('issuer')
-                result.ssl_expiry = ssl_info.get('expiry')
-        
-        return result
-    
-    def get_geolocation(self, ip: str) -> Dict:
-        """Get IP geolocation info"""
-        geo = {}
+        # TLS certificate SAN
         try:
-            url = f"http://ip-api.com/json/{ip}"
+            san_domains = self._get_tls_san_domains(ip)
+            domains.tls_san_domains = san_domains
+            all_found.update(san_domains)
+        except:
+            pass
+        
+        # Certificate Transparency
+        try:
+            ct_domains = self._get_ct_log_domains(ip)
+            domains.ct_log_domains = ct_domains
+            all_found.update(ct_domains)
+        except:
+            pass
+        
+        domains.all_domains = sorted(list(all_found))
+        return domains
+    
+    def _get_tls_san_domains(self, ip: str) -> List[str]:
+        """Extract SAN domains from TLS certificate"""
+        domains = []
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((ip, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=ip) as ssock:
+                    cert = ssock.getpeercert()
+                    
+                    # Get SAN
+                    if 'subjectAltName' in cert:
+                        for entry in cert['subjectAltName']:
+                            if entry[0] == 'DNS':
+                                domain = entry[1].replace('*.', '')
+                                domains.append(domain)
+                    
+                    # Get CN
+                    if 'subject' in cert:
+                        for rdn in cert['subject']:
+                            for name, value in rdn:
+                                if name == 'commonName':
+                                    cn = value.replace('*.', '')
+                                    if cn not in domains:
+                                        domains.append(cn)
+        except:
+            pass
+        
+        return domains[:20]  # Limit to 20 domains
+    
+    def _get_ct_log_domains(self, ip: str) -> List[str]:
+        """Get domains from Certificate Transparency logs"""
+        domains = []
+        
+        try:
+            # Use crt.sh
+            url = f"https://crt.sh/?q={ip}&output=json"
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                for entry in data[:50]:  # Limit
+                    name_value = entry.get('name_value', '')
+                    for domain in name_value.split('\n'):
+                        domain = domain.strip().replace('*.', '')
+                        if domain and domain not in domains:
+                            domains.append(domain)
+        except:
+            pass
+        
+        return domains[:20]
+    
+    def get_asn_info(self, ip: str) -> Tuple[Optional[str], Optional[str]]:
+        """Get ASN and organization (with caching)"""
+        cached = self.asn_cache.get(ip)
+        if cached:
+            return cached.get('asn'), cached.get('org')
+        
+        try:
+            self.rate_limiter.wait()
+            url = f"http://ip-api.com/json/{ip}?fields=as"
             response = self.session.get(url, timeout=5)
             
             if response.status_code == 200:
                 data = response.json()
-                geo['country'] = data.get('countryCode')
-                geo['country_name'] = data.get('country')
-                geo['city'] = data.get('city')
-                geo['region'] = data.get('regionName')
-                geo['isp'] = data.get('isp')
-                geo['organization'] = data.get('org')
-                geo['asn'] = data.get('as')
+                asn_full = data.get('as', '')
+                
+                if asn_full:
+                    parts = asn_full.split(' ', 1)
+                    asn = parts[0] if parts else ''
+                    org = parts[1] if len(parts) > 1 else ''
+                    
+                    result = {'asn': asn, 'org': org}
+                    self.asn_cache.set(ip, result)
+                    return asn, org
         except:
             pass
         
-        return geo
+        return None, None
     
-    def analyze_web_server(self, ip: str) -> Dict:
-        """Analyze web server"""
-        web_info = {}
+    def comprehensive_scan(self, ip: str, keywords: List[str] = None, 
+                          country_code: Optional[str] = None) -> IPAnalysisResult:
+        """Comprehensive IP analysis"""
+        result = IPAnalysisResult(ip=ip, source_keywords=keywords or [], target_country=country_code)
         
         try:
-            protocol = "https" if 443 in getattr(self, '_temp_ports', [443]) else "http"
-            response = self.session.get(f"{protocol}://{ip}", timeout=5, verify=False)
+            # Liveness detection
+            result.liveness = self.advanced_liveness_check(ip)
             
-            web_info['server'] = response.headers.get('Server', 'Unknown')
+            if result.liveness.status == "dead":
+                result.confidence_score = 1.0
+                return result
             
-            security_headers = {}
-            for header in ['Strict-Transport-Security', 'X-Frame-Options', 'X-Content-Type-Options']:
-                if header in response.headers:
-                    security_headers[header] = response.headers[header]
-            web_info['security_headers'] = security_headers
+            # Port scan (limited)
+            open_ports = []
+            for port in [80, 443, 22, 21, 25, 3306, 8080]:
+                if self._tcp_handshake(ip, port, timeout=1):
+                    open_ports.append(port)
+                time.sleep(0.05)
             
+            result.tcp_ports_open = open_ports
+            
+            # ASN lookup
+            asn, asn_org = self.get_asn_info(ip)
+            result.asn = asn
+            result.asn_org = asn_org
+            
+            # Geolocation
             try:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(response.text, 'html.parser')
-                if soup.title:
-                    web_info['title'] = soup.title.string.strip()[:100] if soup.title.string else None
+                self.rate_limiter.wait()
+                geo = self._get_geolocation(ip)
+                result.country = geo.get('country')
+                result.country_name = geo.get('country_name')
+                result.city = geo.get('city')
+                result.isp = geo.get('isp')
             except:
                 pass
             
-            technologies = []
-            html_lower = response.text.lower()
+            # Get headers for classification
+            headers = {}
+            try:
+                protocol = "https" if result.liveness.https_responsive else "http"
+                response = self.session.head(f"{protocol}://{ip}", timeout=5, verify=False, allow_redirects=True)
+                headers = dict(response.headers)
+                result.web_server = headers.get('Server', 'Unknown')
+            except:
+                pass
             
-            if 'wordpress' in html_lower:
-                technologies.append('WordPress')
-            if 'react' in html_lower:
-                technologies.append('React')
-            if 'jquery' in html_lower:
-                technologies.append('jQuery')
+            # Hosting classification
+            if asn:
+                result.hosting = CDNDetector.classify_hosting(asn, asn_org or '', headers)
+                result.is_cdn = result.hosting.hosting_type == "cdn"
+                result.cdn_provider = result.hosting.provider if result.is_cdn else None
             
-            web_info['technologies'] = technologies
+            # Domain attribution (only for origin servers or if explicitly needed)
+            if result.hosting.is_origin or result.liveness.status == "alive":
+                result.domains = self.get_domain_attribution(ip)
+            
+            # SSL check
+            if result.liveness.tls_handshake or result.liveness.https_responsive:
+                try:
+                    ssl_info = self._get_ssl_info(ip)
+                    result.ssl_valid = ssl_info.get('valid', False)
+                    result.ssl_issuer = ssl_info.get('issuer')
+                    result.ssl_subject = ssl_info.get('subject')
+                except:
+                    pass
+            
+            # Web title
+            if result.liveness.status == "alive":
+                try:
+                    result.web_title = self._get_web_title(ip)
+                except:
+                    pass
+            
+            # Calculate confidence score
+            result.confidence_score = self._calculate_confidence(result)
         
+        except Exception:
+            pass
+        
+        return result
+    
+    def _get_geolocation(self, ip: str) -> Dict:
+        """Get geolocation"""
+        try:
+            url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp"
+            response = self.session.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    return {
+                        'country': data.get('countryCode'),
+                        'country_name': data.get('country'),
+                        'city': data.get('city'),
+                        'isp': data.get('isp')
+                    }
         except:
             pass
         
-        return web_info
+        return {}
     
-    def check_ssl(self, ip: str) -> Dict:
-        """Check SSL certificate"""
+    def _get_ssl_info(self, ip: str) -> Dict:
+        """Get SSL certificate info"""
         ssl_info = {}
         
         try:
             context = ssl.create_default_context()
-            with socket.create_connection((ip, 443), timeout=5) as sock:
+            with socket.create_connection((ip, 443), timeout=3) as sock:
                 with context.wrap_socket(sock, server_hostname=ip) as ssock:
                     cert = ssock.getpeercert()
                     
@@ -871,398 +553,762 @@ class SpiderWebCLI:
                         issuer = dict(x[0] for x in cert['issuer'])
                         ssl_info['issuer'] = issuer.get('organizationName', 'Unknown')
                     
-                    if 'notAfter' in cert:
-                        ssl_info['expiry'] = cert['notAfter']
+                    if 'subject' in cert:
+                        subject = dict(x[0] for x in cert['subject'])
+                        ssl_info['subject'] = subject.get('commonName', 'Unknown')
         except:
             ssl_info['valid'] = False
         
         return ssl_info
     
-    def batch_scan(self, ips: List[str], keyword: Optional[str] = None):
-        """Scan multiple IPs with randomization and adaptive pacing"""
-        self.log(f"Starting batch scan of {len(ips)} IPs", "SCAN")
-        
-        # Randomize IP order to avoid sequential subnet scanning
-        randomized_ips = ips.copy()
-        random.shuffle(randomized_ips)
-        
-        self.log("IPs randomized for stealth scanning", "INFO")
-        
-        live_count = 0
-        dead_count = 0
-        
-        print(f"\n{Colors.BOLD}═══ SCANNING PROGRESS ═══{Colors.ENDC}\n")
-        print(f"{Colors.OKBLUE}Phase 1: Quick liveness checks{Colors.ENDC}")
-        print(f"{Colors.OKBLUE}Phase 2: Comprehensive scans on live IPs only{Colors.ENDC}\n")
-        
-        # Phase 1: Quick liveness screening
-        live_ips = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(self.check_liveness_lightweight, ip): ip for ip in randomized_ips}
+    def _get_web_title(self, ip: str) -> Optional[str]:
+        """Get web page title"""
+        try:
+            protocol = "https" if self._tcp_handshake(ip, 443, 1) else "http"
+            response = self.session.get(f"{protocol}://{ip}", timeout=5, verify=False, stream=True)
             
-            for idx, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                ip = futures[future]
-                try:
-                    is_live = future.result()
-                    if is_live:
-                        live_ips.append(ip)
-                        live_count += 1
-                    else:
-                        dead_count += 1
-                        # Still add dead result
-                        self.results.append(IPAnalysisResult(ip=ip, is_live=False, source_keyword=keyword))
-                    
-                    progress = idx / len(randomized_ips) * 100
-                    bar_length = 30
-                    filled = int(bar_length * idx / len(randomized_ips))
-                    bar = '█' * filled + '░' * (bar_length - filled)
-                    
-                    print(f"\r{Colors.OKCYAN}Phase 1 [{bar}] {progress:.1f}%{Colors.ENDC} | "
-                          f"{Colors.OKGREEN}Live: {live_count}{Colors.ENDC} | "
-                          f"{Colors.FAIL}Dead: {dead_count}{Colors.ENDC}", end='', flush=True)
-                
-                except Exception as e:
-                    dead_count += 1
-                    self.results.append(IPAnalysisResult(ip=ip, is_live=False, source_keyword=keyword))
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.content[:2048], 'html.parser')
+            if soup.title and soup.title.string:
+                return soup.title.string.strip()[:100]
+        except:
+            pass
         
-        print(f"\n\n{Colors.OKGREEN}✓ Phase 1 complete: {live_count} live IPs identified{Colors.ENDC}\n")
-        
-        # Phase 2: Comprehensive scan of live IPs only
-        if live_ips:
-            print(f"{Colors.OKBLUE}Phase 2: Deep scanning {len(live_ips)} live IPs...{Colors.ENDC}\n")
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(self.comprehensive_scan, ip, keyword): ip for ip in live_ips}
-                
-                for idx, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                    ip = futures[future]
-                    try:
-                        result = future.result()
-                        self.results.append(result)
-                        
-                        progress = idx / len(live_ips) * 100
-                        bar_length = 30
-                        filled = int(bar_length * idx / len(live_ips))
-                        bar = '█' * filled + '░' * (bar_length - filled)
-                        
-                        print(f"\r{Colors.OKCYAN}Phase 2 [{bar}] {progress:.1f}%{Colors.ENDC} | "
-                              f"Scanned: {idx}/{len(live_ips)}", end='', flush=True)
-                    
-                    except Exception as e:
-                        self.log(f"Error in deep scan of {ip}: {str(e)}", "ERROR")
-        
-        print(f"\n\n{Colors.BOLD}═══ SCAN COMPLETE ═══{Colors.ENDC}\n")
-        self.log(f"Final results: {live_count} live, {dead_count} dead/unreachable", "SUCCESS")
+        return None
     
-    def display_results(self):
-        """Display scan results"""
-        if not self.results:
-            self.log("No results to display", "WARNING")
+    def _calculate_confidence(self, result: IPAnalysisResult) -> float:
+        """Calculate confidence score for classification"""
+        score = 0.0
+        
+        # Base score from hosting classification
+        score = result.hosting.confidence
+        
+        # Boost for origin servers with domains
+        if result.hosting.is_origin and result.domains.all_domains:
+            score = min(1.0, score + 0.1)
+        
+        # Boost for valid SSL
+        if result.ssl_valid:
+            score = min(1.0, score + 0.05)
+        
+        # Penalize if CDN
+        if result.is_cdn:
+            score = max(0.0, score - 0.2)
+        
+        return round(score, 2)
+
+
+class RateLimiter:
+    """Thread-safe rate limiter"""
+    
+    def __init__(self, requests_per_second: float = 10.0):
+        self.requests_per_second = requests_per_second
+        self.min_interval = 1.0 / requests_per_second
+        self.last_request = 0
+        self.lock = threading.Lock()
+    
+    def wait(self):
+        """Wait with jitter"""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_request
+            
+            if elapsed < self.min_interval:
+                jitter = random.uniform(0, self.min_interval * 0.3)
+                sleep_time = (self.min_interval - elapsed) + jitter
+                time.sleep(sleep_time)
+            
+            self.last_request = time.time()
+
+
+class MultiKeywordIPGenerator:
+    """Multi-keyword IP generator with parallel processing"""
+    
+    def __init__(self, rate_limiter: RateLimiter):
+        self.rate_limiter = rate_limiter
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        self.ip_counter = 0
+        self.counter_lock = threading.Lock()
+    
+    def generate_ips_multi_keyword(self, keywords: List[str], target_count: int, 
+                                   country_code: Optional[str] = None) -> Tuple[Set[str], Dict[str, int]]:
+        """Generate IPs from multiple keywords in parallel"""
+        unique_ips = set()
+        source_stats = defaultdict(int)
+        ips_lock = threading.Lock()
+        
+        print(f"\n{Colors.BOLD}=== IP GENERATION ==={Colors.ENDC}\n")
+        print(f"{Colors.BLUE}Requested IPs: {target_count}{Colors.ENDC}")
+        print(f"{Colors.BLUE}Keywords: {', '.join(keywords)}{Colors.ENDC}")
+        
+        if country_code:
+            print(f"{Colors.BLUE}Target Country: {country_code.upper()}{Colors.ENDC}")
+        else:
+            print(f"{Colors.BLUE}Target: Worldwide{Colors.ENDC}")
+        
+        print()
+        
+        # Calculate per-keyword target
+        per_keyword = max(10, target_count // len(keywords))
+        
+        def process_keyword(keyword):
+            """Process single keyword"""
+            keyword_ips = set()
+            
+            # DNS discovery
+            try:
+                dns_ips = self._discover_dns_ips(keyword, per_keyword, country_code)
+                keyword_ips.update(dns_ips)
+                self._update_progress(len(dns_ips), 'DNS', ips_lock, unique_ips, dns_ips)
+            except:
+                pass
+            
+            # URLScan
+            try:
+                self.rate_limiter.wait()
+                urlscan_ips = self._search_urlscan_ips(keyword, per_keyword, country_code)
+                keyword_ips.update(urlscan_ips)
+                self._update_progress(len(urlscan_ips), 'URLScan', ips_lock, unique_ips, urlscan_ips)
+            except:
+                pass
+            
+            # ThreatCrowd
+            try:
+                self.rate_limiter.wait()
+                threat_ips = self._search_threatcrowd_ips(keyword, per_keyword)
+                keyword_ips.update(threat_ips)
+                self._update_progress(len(threat_ips), 'ThreatCrowd', ips_lock, unique_ips, threat_ips)
+            except:
+                pass
+            
+            return keyword_ips
+        
+        # Parallel processing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(keywords)) as executor:
+            futures = {executor.submit(process_keyword, kw): kw for kw in keywords}
+            
+            for future in concurrent.futures.as_completed(futures):
+                keyword = futures[future]
+                try:
+                    keyword_ips = future.result()
+                    with ips_lock:
+                        new_ips = keyword_ips - unique_ips
+                        unique_ips.update(new_ips)
+                        source_stats[keyword] = len(keyword_ips)
+                except:
+                    pass
+        
+        # Filter by country if needed
+        if country_code and unique_ips:
+            print(f"\n{Colors.CYAN}Filtering by country: {country_code.upper()}...{Colors.ENDC}")
+            filtered = self._filter_by_country(unique_ips, country_code)
+            print(f"{Colors.GREEN}{len(filtered)} IPs match target country{Colors.ENDC}")
+            return filtered, dict(source_stats)
+        
+        return unique_ips, dict(source_stats)
+    
+    def _update_progress(self, count: int, source: str, lock, unique_ips: Set, new_ips: Set):
+        """Thread-safe progress update"""
+        with lock:
+            added = new_ips - unique_ips
+            if added:
+                with self.counter_lock:
+                    self.ip_counter += len(added)
+                print(f"  {source}: +{len(added)} IPs (Total: {self.ip_counter})")
+    
+    def _filter_by_country(self, ips: Set[str], country_code: str) -> Set[str]:
+        """Filter IPs by country"""
+        filtered = set()
+        country_upper = country_code.upper()
+        
+        for ip in list(ips)[:200]:  # Limit to avoid rate limiting
+            try:
+                self.rate_limiter.wait()
+                url = f"http://ip-api.com/json/{ip}?fields=countryCode"
+                response = self.session.get(url, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('countryCode', '').upper() == country_upper:
+                        filtered.add(ip)
+            except:
+                pass
+        
+        return filtered
+    
+    def _discover_dns_ips(self, keyword: str, limit: int, country_code: Optional[str]) -> Set[str]:
+        """DNS discovery"""
+        ips = set()
+        
+        tlds = ['com', 'net', 'org', 'io', 'ai', 'dev']
+        
+        if country_code:
+            country_tlds = {
+                'US': ['us'],
+                'UK': ['uk', 'co.uk'],
+                'RU': ['ru'],
+                'CA': ['ca'],
+                'AU': ['au'],
+                'DE': ['de'],
+                'FR': ['fr'],
+            }
+            tlds = country_tlds.get(country_code.upper(), []) + tlds[:3]
+        
+        subdomains = ['www', 'mail', 'api', 'app']
+        
+        patterns = []
+        for tld in tlds[:5]:
+            patterns.append(f"{keyword}.{tld}")
+            for sub in subdomains[:2]:
+                patterns.append(f"{sub}.{keyword}.{tld}")
+        
+        for pattern in patterns[:30]:
+            if len(ips) >= limit:
+                break
+            
+            try:
+                ip = socket.gethostbyname(pattern)
+                if self._is_valid_ip(ip) and not self._is_private_ip(ip):
+                    ips.add(ip)
+            except:
+                pass
+            
+            time.sleep(0.03)
+        
+        return ips
+    
+    def _search_urlscan_ips(self, keyword: str, limit: int, country_code: Optional[str]) -> Set[str]:
+        """URLScan search"""
+        ips = set()
+        
+        try:
+            url = "https://urlscan.io/api/v1/search/"
+            
+            if country_code:
+                query = f'domain:{keyword} country:{country_code.upper()}'
+            else:
+                query = f'domain:{keyword}'
+            
+            params = {'q': query, 'size': min(100, limit * 2)}
+            
+            response = self.session.get(url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                for result in data.get('results', []):
+                    page = result.get('page', {})
+                    ip = page.get('ip', '')
+                    
+                    if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
+                        ips.add(ip)
+                        if len(ips) >= limit:
+                            break
+        except:
+            pass
+        
+        return ips
+    
+    def _search_threatcrowd_ips(self, keyword: str, limit: int) -> Set[str]:
+        """ThreatCrowd search"""
+        ips = set()
+        
+        try:
+            url = f"https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={keyword}"
+            response = self.session.get(url, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('response_code') == '1':
+                    for resolution in data.get('resolutions', []):
+                        ip = resolution.get('ip_address', '')
+                        if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
+                            ips.add(ip)
+                            if len(ips) >= limit:
+                                break
+        except:
+            pass
+        
+        return ips
+    
+    def _is_valid_ip(self, ip: str) -> bool:
+        """Validate IP"""
+        try:
+            pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+            if re.match(pattern, ip):
+                parts = ip.split('.')
+                return all(0 <= int(part) <= 255 for part in parts)
+        except:
+            pass
+        return False
+    
+    def _is_private_ip(self, ip: str) -> bool:
+        """Check private IP"""
+        try:
+            parts = list(map(int, ip.split('.')))
+            
+            if parts[0] == 10:
+                return True
+            if parts[0] == 172 and 16 <= parts[1] <= 31:
+                return True
+            if parts[0] == 192 and parts[1] == 168:
+                return True
+            if parts[0] == 127 or parts[0] == 0:
+                return True
+        except:
+            pass
+        
+        return False
+
+
+class SpiderWebCLI:
+    """SpiderWeb CLI"""
+    
+    VERSION = "7.0"
+    BANNER = f"""
+{Colors.BOLD}{Colors.GREEN}╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║         ╔═╗┌─┐┬┌┬┐┌─┐┬─┐╦ ╦┌─┐┌┐     ╔═╗╦═╗╔═╗                    ║
+║         ╚═╗├─┘│ ││├┤ ├┬┘║║║├┤ ├┴┐    ╠═╝╠╦╝║ ║                    ║
+║         ╚═╝┴  ┴─┴┘└─┘┴└─╚╩╝└─┘└─┘    ╩  ╩╚═╚═╝                    ║
+║                                                                   ║
+║{Colors.ENDC}       {Colors.RED}Professional IP Analysis v{VERSION} - Origin Detection{Colors.ENDC}         {Colors.GREEN}   ║
+║{Colors.ENDC}                        {Colors.WHITE}by g33l0{Colors.ENDC}                                   {Colors.GREEN}    ║
+║                                                                   ║
+║   ┌─────────────────────────────────────────────────────────┐     ║
+║   │  Scan | Worldwide | CDN Bypass | Advanced Detection     │     ║
+║   └─────────────────────────────────────────────────────────┘     ║
+╚═══════════════════════════════════════════════════════════════════╝{Colors.ENDC}
+"""
+    
+    MAX_IPS = 4000
+    REQUESTS_PER_SECOND = 8.0
+    
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self.results: List[IPAnalysisResult] = []
+        
+        self.rate_limiter = RateLimiter(self.REQUESTS_PER_SECOND)
+        self.ip_generator = MultiKeywordIPGenerator(self.rate_limiter)
+        self.scanner = AdvancedScanner(self.rate_limiter)
+        
+        signal.signal(signal.SIGINT, self._signal_handler)
+    
+    def _signal_handler(self, sig, frame):
+        """Handle Ctrl+C"""
+        print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.ENDC}")
+        sys.exit(0)
+    
+    def print_banner(self):
+        """Display banner"""
+        print(self.BANNER)
+    
+    def log(self, message: str, level: str = "INFO"):
+        """Logging"""
+        if not self.verbose:
             return
         
-        live_results = [r for r in self.results if r.is_live]
-        dead_results = [r for r in self.results if not r.is_live]
+        timestamp = datetime.now().strftime("%H:%M:%S")
         
-        print(f"\n{Colors.BOLD}{'═'*80}{Colors.ENDC}")
-        print(f"{Colors.BOLD}{'SCAN RESULTS SUMMARY':^80}{Colors.ENDC}")
-        print(f"{Colors.BOLD}{'═'*80}{Colors.ENDC}\n")
+        colors = {
+            "INFO": Colors.BLUE,
+            "SUCCESS": Colors.GREEN,
+            "ERROR": Colors.RED,
+            "WARNING": Colors.YELLOW,
+        }
         
-        print(f"{Colors.OKGREEN}🟢 Live IPs: {len(live_results)}{Colors.ENDC}")
-        print(f"{Colors.FAIL}🔴 Dead/Unreachable IPs: {len(dead_results)}{Colors.ENDC}")
-        print(f"{Colors.OKBLUE}📊 Total Scanned: {len(self.results)}{Colors.ENDC}")
+        color = colors.get(level, Colors.WHITE)
+        print(f"{color}[{timestamp}] {message}{Colors.ENDC}")
+    
+    def get_input(self, prompt: str, allow_back: bool = True) -> str:
+        """Get user input with navigation"""
+        nav = " (ESC=Exit"
+        if allow_back:
+            nav += ", 0=Back"
+        nav += ")"
         
-        if len(self.results) > 0:
-            success_rate = len(live_results) / len(self.results) * 100
-            print(f"{Colors.OKCYAN}📈 Success Rate: {success_rate:.1f}%{Colors.ENDC}\n")
+        full_prompt = f"{prompt}{Colors.BOLD}{nav}: {Colors.ENDC}"
         
-        if live_results:
+        try:
+            user_input = input(full_prompt).strip()
+            
+            if user_input.upper() == 'ESC' or user_input == '\x1b':
+                raise ExitException()
+            
+            if user_input == '0' and allow_back:
+                raise NavigationException()
+            
+            return user_input
+        
+        except (KeyboardInterrupt, EOFError):
+            raise ExitException()
+    
+    def prompt_input_method(self) -> str:
+        """Input method selection"""
+        while True:
+            try:
+                print(f"\n{Colors.BOLD}=== SELECT INPUT METHOD ==={Colors.ENDC}\n")
+                print(f"{Colors.CYAN}1.{Colors.ENDC} Keyword-based IP generation")
+                print(f"{Colors.CYAN}2.{Colors.ENDC} Scan IPs from file (ips.txt)")
+                
+                choice = self.get_input("\nEnter choice (1 or 2)", allow_back=False)
+                
+                if choice == "1":
+                    return "keyword"
+                elif choice == "2":
+                    return "file"
+                else:
+                    print(f"{Colors.RED}Invalid choice.{Colors.ENDC}")
+            
+            except NavigationException:
+                continue
+            except ExitException:
+                sys.exit(0)
+    
+    def get_country_input(self) -> Optional[str]:
+        """Get country code"""
+        while True:
+            try:
+                print(f"\n{Colors.BOLD}=== TARGET LOCATION ==={Colors.ENDC}\n")
+                print(f"{Colors.CYAN}Enter country code or 0 for worldwide{Colors.ENDC}")
+                print(f"\n{Colors.BOLD}Popular:{Colors.ENDC}")
+                print("  US - United States    UK - United Kingdom    CA - Canada")
+                print("  AU - Australia        DE - Germany           FR - France")
+                print("  JP - Japan            CN - China             IN - India")
+                print("  BR - Brazil           RU - Russia            ZA - South Africa")
+                
+                country = self.get_input("\nCountry code", allow_back=True).upper()
+                
+                if country == "0":
+                    return None
+                
+                if len(country) == 2 and country.isalpha():
+                    return country
+                else:
+                    print(f"{Colors.RED}Invalid code. Use 2 letters (e.g., US).{Colors.ENDC}")
+            
+            except NavigationException:
+                raise
+    
+    def get_keyword_input(self) -> Tuple[List[str], int, Optional[str]]:
+        """Get keywords, count, and country"""
+        while True:
+            try:
+                print(f"\n{Colors.BOLD}=== KEYWORD-BASED IP GENERATION ==={Colors.ENDC}\n")
+                
+                # Keywords
+                keywords_input = self.get_input("Enter keywords (comma-separated)", allow_back=True)
+                
+                if not keywords_input:
+                    print(f"{Colors.RED}Keywords cannot be empty.{Colors.ENDC}")
+                    continue
+                
+                keywords = [k.strip() for k in keywords_input.split(',') if k.strip()]
+                
+                if not keywords:
+                    print(f"{Colors.RED}Please enter at least one keyword.{Colors.ENDC}")
+                    continue
+                
+                # Count
+                while True:
+                    try:
+                        count_input = self.get_input(f"How many IPs? (max {self.MAX_IPS})", allow_back=True)
+                        count = int(count_input)
+                        
+                        if count <= 0:
+                            print(f"{Colors.RED}Must be greater than 0.{Colors.ENDC}")
+                            continue
+                        
+                        if count > self.MAX_IPS:
+                            print(f"{Colors.RED}Maximum is {self.MAX_IPS}.{Colors.ENDC}")
+                            continue
+                        
+                        break
+                    
+                    except ValueError:
+                        print(f"{Colors.RED}Invalid number.{Colors.ENDC}")
+                    except NavigationException:
+                        raise
+                
+                # Country
+                country = self.get_country_input()
+                
+                return keywords, count, country
+            
+            except NavigationException:
+                continue
+    
+    def read_ips_from_file(self, filename: str = "ips.txt") -> List[str]:
+        """Read IPs from file"""
+        filepath = Path(filename)
+        
+        if not filepath.exists():
+            self.log(f"File '{filename}' not found", "ERROR")
+            raise NavigationException()
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            ips = []
+            for line in lines:
+                ip = line.strip()
+                
+                if not ip or ip.startswith('#'):
+                    continue
+                
+                if self.is_valid_ip(ip):
+                    ips.append(ip)
+            
+            if not ips:
+                self.log("No valid IPs found", "ERROR")
+                raise NavigationException()
+            
+            unique = list(dict.fromkeys(ips))
+            
+            if len(unique) > self.MAX_IPS:
+                unique = unique[:self.MAX_IPS]
+            
+            self.log(f"Loaded {len(unique)} IPs", "SUCCESS")
+            return unique
+        
+        except Exception as e:
+            self.log(f"Error: {str(e)}", "ERROR")
+            raise NavigationException()
+    
+    def is_valid_ip(self, ip: str) -> bool:
+        """Validate IP"""
+        try:
+            pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+            if re.match(pattern, ip):
+                parts = ip.split('.')
+                return all(0 <= int(part) <= 255 for part in parts)
+        except:
+            pass
+        return False
+    
+    def batch_scan(self, ips: List[str], keywords: List[str] = None, country_code: Optional[str] = None):
+        """Batch scan with advanced detection"""
+        
+        randomized = ips.copy()
+        random.shuffle(randomized)
+        
+        self.log(f"Starting scan of {len(randomized)} IPs", "INFO")
+        
+        print(f"\n{Colors.BOLD}=== ADVANCED SCANNING ==={Colors.ENDC}\n")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = {executor.submit(self.scanner.comprehensive_scan, ip, keywords, country_code): ip 
+                      for ip in randomized}
+            
+            completed = 0
+            total = len(randomized)
+            
+            for future in concurrent.futures.as_completed(futures):
+                ip = futures[future]
+                try:
+                    result = future.result()
+                    self.results.append(result)
+                    
+                    completed += 1
+                    progress = completed / total * 100
+                    bar_length = 30
+                    filled = int(bar_length * completed / total)
+                    bar = '█' * filled + '░' * (bar_length - filled)
+                    
+                    print(f"\r{Colors.CYAN}[{bar}] {progress:.1f}%{Colors.ENDC} | "
+                          f"Scanned: {completed}/{total}", end='', flush=True)
+                
+                except Exception:
+                    self.results.append(IPAnalysisResult(ip=ip))
+        
+        print(f"\n\n{Colors.BOLD}=== SCAN COMPLETE ==={Colors.ENDC}\n")
+        self.log(f"Scanned {len(self.results)} IPs", "SUCCESS")
+    
+    def display_results(self):
+        """Display results"""
+        if not self.results:
+            self.log("No results", "WARNING")
+            return
+        
+        alive = [r for r in self.results if r.liveness.status in ["alive", "tls_only"]]
+        origin = [r for r in alive if r.hosting.is_origin]
+        cdn = [r for r in alive if r.is_cdn]
+        dead = [r for r in self.results if r.liveness.status == "dead"]
+        
+        print(f"\n{Colors.BOLD}{'='*80}{Colors.ENDC}")
+        print(f"{Colors.BOLD}{'RESULTS SUMMARY':^80}{Colors.ENDC}")
+        print(f"{Colors.BOLD}{'='*80}{Colors.ENDC}\n")
+        
+        print(f"{Colors.GREEN}Origin Servers: {len(origin)}{Colors.ENDC}")
+        print(f"{Colors.YELLOW}CDN/Proxies: {len(cdn)}{Colors.ENDC}")
+        print(f"{Colors.CYAN}Total Alive: {len(alive)}{Colors.ENDC}")
+        print(f"{Colors.RED}Dead: {len(dead)}{Colors.ENDC}\n")
+        
+        if origin:
             print(f"{Colors.BOLD}{'─'*80}{Colors.ENDC}")
-            print(f"{Colors.BOLD}LIVE IP DETAILS (showing first 20){Colors.ENDC}")
+            print(f"{Colors.BOLD}ORIGIN SERVERS (Top 15){Colors.ENDC}")
             print(f"{Colors.BOLD}{'─'*80}{Colors.ENDC}\n")
             
-            for idx, result in enumerate(live_results[:20], 1):
-                print(f"{Colors.OKGREEN}[{idx}] {result.ip}{Colors.ENDC}")
+            for idx, r in enumerate(origin[:15], 1):
+                print(f"{Colors.GREEN}[{idx}] {r.ip}{Colors.ENDC} | {r.hosting.hosting_type.upper()}")
+                print(f"    Status: {r.liveness.status.upper()} | Confidence: {r.confidence_score}")
                 
-                if result.country_name:
-                    print(f"    ├─ Location: {result.city or 'Unknown'}, {result.country_name} ({result.country})")
+                if r.country_name:
+                    print(f"    Location: {r.city or 'Unknown'}, {r.country_name}")
                 
-                if result.isp:
-                    print(f"    ├─ ISP: {result.isp}")
+                if r.domains.all_domains:
+                    domains_str = ', '.join(r.domains.all_domains[:3])
+                    if len(r.domains.all_domains) > 3:
+                        domains_str += f" +{len(r.domains.all_domains)-3} more"
+                    print(f"    Domains: {domains_str}")
                 
-                if result.organization:
-                    print(f"    ├─ Organization: {result.organization}")
+                if r.hosting.provider:
+                    print(f"    Provider: {r.hosting.provider}")
                 
-                if result.reverse_dns:
-                    print(f"    ├─ Reverse DNS: {result.reverse_dns}")
-                
-                if result.tcp_ports_open:
-                    print(f"    ├─ Open Ports: {', '.join(map(str, result.tcp_ports_open))}")
-                
-                if result.http_status or result.https_status:
-                    print(f"    ├─ HTTP: {result.http_status or 'N/A'} | HTTPS: {result.https_status or 'N/A'}")
-                
-                if result.web_server:
-                    print(f"    ├─ Web Server: {result.web_server}")
-                
-                if result.web_title:
-                    print(f"    ├─ Title: {result.web_title}")
-                
-                if result.detected_technologies:
-                    print(f"    ├─ Technologies: {', '.join(result.detected_technologies)}")
-                
-                if result.ssl_valid:
-                    print(f"    ├─ SSL: Valid ✓ ({result.ssl_issuer})")
-                
-                if result.response_time:
-                    print(f"    └─ Response Time: {result.response_time*1000:.0f}ms")
-                else:
-                    print(f"    └─")
+                if r.tcp_ports_open:
+                    print(f"    Ports: {', '.join(map(str, r.tcp_ports_open[:5]))}")
                 
                 print()
-            
-            if len(live_results) > 20:
-                print(f"{Colors.WARNING}... and {len(live_results) - 20} more live IPs (see export files for full list){Colors.ENDC}\n")
     
     def export_results(self):
-        """Export results to files"""
+        """Export results"""
+        if not self.results:
+            return
+        
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        json_file = f"spiderweb_results_{timestamp}.json"
-        self.export_json(json_file)
+        json_file = f"spiderweb_{timestamp}.json"
+        csv_file = f"spiderweb_{timestamp}.csv"
         
-        csv_file = f"spiderweb_results_{timestamp}.csv"
+        self.export_json(json_file)
         self.export_csv(csv_file)
         
-        txt_file = f"spiderweb_report_{timestamp}.txt"
-        self.export_txt(txt_file)
-        
-        print(f"\n{Colors.BOLD}═══ EXPORT COMPLETE ═══{Colors.ENDC}\n")
-        print(f"{Colors.OKGREEN}✓{Colors.ENDC} JSON: {json_file}")
-        print(f"{Colors.OKGREEN}✓{Colors.ENDC} CSV: {csv_file}")
-        print(f"{Colors.OKGREEN}✓{Colors.ENDC} TXT: {txt_file}\n")
+        print(f"\n{Colors.BOLD}=== EXPORT COMPLETE ==={Colors.ENDC}\n")
+        print(f"{Colors.GREEN}JSON: {json_file}{Colors.ENDC}")
+        print(f"{Colors.GREEN}CSV: {csv_file}{Colors.ENDC}\n")
     
     def export_json(self, filename: str):
-        """Export to JSON"""
+        """Export JSON"""
         output = {
             'metadata': {
-                'tool': 'SpiderWeb CLI',
+                'tool': 'SpiderWeb Pro',
                 'version': self.VERSION,
                 'author': 'g33l0',
                 'timestamp': datetime.now().isoformat(),
-                'total_scanned': len(self.results),
-                'live_count': sum(1 for r in self.results if r.is_live),
-                'dead_count': sum(1 for r in self.results if not r.is_live)
+                'total': len(self.results)
             },
             'results': [asdict(r) for r in self.results]
         }
         
-        with open(filename, 'w') as f:
+        with open(filename, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=2)
     
     def export_csv(self, filename: str):
-        """Export to CSV"""
-        with open(filename, 'w', newline='') as f:
-            fieldnames = ['ip', 'is_live', 'country', 'city', 'isp', 'organization',
-                         'reverse_dns', 'open_ports', 'http_status', 'https_status',
-                         'web_server', 'ssl_valid', 'response_time_ms']
+        """Export CSV"""
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['ip', 'status', 'hosting_type', 'is_origin', 'confidence', 
+                         'domains', 'country', 'city', 'provider', 'asn']
             
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             
-            for result in self.results:
+            for r in self.results:
                 writer.writerow({
-                    'ip': result.ip,
-                    'is_live': result.is_live,
-                    'country': result.country,
-                    'city': result.city,
-                    'isp': result.isp,
-                    'organization': result.organization,
-                    'reverse_dns': result.reverse_dns,
-                    'open_ports': ','.join(map(str, result.tcp_ports_open)),
-                    'http_status': result.http_status,
-                    'https_status': result.https_status,
-                    'web_server': result.web_server,
-                    'ssl_valid': result.ssl_valid,
-                    'response_time_ms': round(result.response_time * 1000) if result.response_time else None
+                    'ip': r.ip,
+                    'status': r.liveness.status,
+                    'hosting_type': r.hosting.hosting_type,
+                    'is_origin': r.hosting.is_origin,
+                    'confidence': r.confidence_score,
+                    'domains': ','.join(r.domains.all_domains[:5]),
+                    'country': r.country or '',
+                    'city': r.city or '',
+                    'provider': r.hosting.provider or '',
+                    'asn': r.asn or ''
                 })
-    
-    def export_txt(self, filename: str):
-        """Export detailed text report"""
-        with open(filename, 'w') as f:
-            f.write("="*80 + "\n")
-            f.write("SpiderWeb 🕸️ - IP Analysis Report\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Author: g33l0\n")
-            f.write("="*80 + "\n\n")
-            
-            live = [r for r in self.results if r.is_live]
-            dead = [r for r in self.results if not r.is_live]
-            
-            f.write("EXECUTIVE SUMMARY\n")
-            f.write("-"*80 + "\n")
-            f.write(f"Total IPs Scanned: {len(self.results)}\n")
-            f.write(f"Live IPs: {len(live)}\n")
-            f.write(f"Dead/Unreachable IPs: {len(dead)}\n")
-            
-            if len(self.results) > 0:
-                f.write(f"Success Rate: {len(live)/len(self.results)*100:.1f}%\n")
-            f.write("\n")
-            
-            f.write("LIVE IP DETAILED ANALYSIS\n")
-            f.write("="*80 + "\n\n")
-            
-            for idx, result in enumerate(live, 1):
-                f.write(f"[{idx}] {result.ip}\n")
-                f.write("-"*80 + "\n")
-                f.write(f"Location: {result.city or 'Unknown'}, {result.country_name or 'Unknown'}\n")
-                f.write(f"ISP: {result.isp or 'Unknown'}\n")
-                f.write(f"Organization: {result.organization or 'Unknown'}\n")
-                f.write(f"ASN: {result.asn or 'Unknown'}\n")
-                
-                if result.reverse_dns:
-                    f.write(f"Reverse DNS: {result.reverse_dns}\n")
-                
-                f.write(f"Open Ports: {result.tcp_ports_open or 'None detected'}\n")
-                f.write(f"HTTP Status: {result.http_status or 'N/A'}\n")
-                f.write(f"HTTPS Status: {result.https_status or 'N/A'}\n")
-                
-                if result.web_server:
-                    f.write(f"Web Server: {result.web_server}\n")
-                
-                if result.web_title:
-                    f.write(f"Page Title: {result.web_title}\n")
-                
-                if result.detected_technologies:
-                    f.write(f"Technologies: {', '.join(result.detected_technologies)}\n")
-                
-                if result.ssl_valid is not None:
-                    f.write(f"SSL Valid: {'Yes' if result.ssl_valid else 'No'}\n")
-                    if result.ssl_valid and result.ssl_issuer:
-                        f.write(f"SSL Issuer: {result.ssl_issuer}\n")
-                
-                if result.response_time:
-                    f.write(f"Response Time: {result.response_time*1000:.2f}ms\n")
-                
-                f.write("\n")
 
 
 def main():
-    """Main CLI entry point"""
+    """Main entry"""
     try:
-        import dns.resolver
         from bs4 import BeautifulSoup
     except ImportError:
-        print("📦 Installing required packages...")
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "dnspython", "beautifulsoup4", "-q"])
-        import dns.resolver
-        from bs4 import BeautifulSoup
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4", "-q"])
     
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except:
+        pass
     
     cli = SpiderWebCLI()
     cli.print_banner()
     
-    try:
-        method = cli.prompt_input_method()
-        
-        ips = []
-        keyword = None
-        
-        if method == "keyword":
-            keyword, requested_count = cli.get_keyword_input()
+    while True:
+        try:
+            method = cli.prompt_input_method()
             
-            print(f"\n{Colors.BOLD}{'═'*70}{Colors.ENDC}")
-            print(f"{Colors.BOLD}IP GENERATION SUMMARY{Colors.ENDC}")
-            print(f"{Colors.BOLD}{'═'*70}{Colors.ENDC}\n")
-            print(f"{Colors.OKBLUE}Requested IPs: {requested_count}{Colors.ENDC}")
+            ips = []
+            keywords = None
+            country = None
             
-            # Generate IPs with retry logic
-            ip_set, source_stats = cli.ip_generator.generate_ips(keyword, requested_count)
-            ips = list(ip_set)
-            
-            print(f"\n{Colors.BOLD}{'─'*70}{Colors.ENDC}")
-            print(f"{Colors.BOLD}GENERATION RESULTS{Colors.ENDC}")
-            print(f"{Colors.BOLD}{'─'*70}{Colors.ENDC}\n")
-            
-            print(f"{Colors.OKGREEN}✓ Generated IPs: {len(ips)}{Colors.ENDC}")
-            print(f"{Colors.OKBLUE}  Requested: {requested_count}{Colors.ENDC}")
-            
-            if len(ips) < requested_count:
-                shortfall = requested_count - len(ips)
-                print(f"\n{Colors.WARNING}⚠️  WARNING: Could only generate {len(ips)}/{requested_count} IPs{Colors.ENDC}")
-                print(f"{Colors.WARNING}   Shortfall: {shortfall} IPs ({shortfall/requested_count*100:.1f}%){Colors.ENDC}\n")
-                print(f"{Colors.OKBLUE}Reasons:{Colors.ENDC}")
-                print(f"  • Limited public data available for keyword '{keyword}'")
-                print(f"  • DNS resolution failures for generated domains")
-                print(f"  • Private/reserved IP addresses filtered out")
-                print(f"  • Duplicate IPs removed across all sources\n")
+            if method == "keyword":
+                keywords, target_count, country = cli.get_keyword_input()
                 
-                print(f"{Colors.OKBLUE}Sources used:{Colors.ENDC}")
-                for source, count in source_stats.items():
-                    print(f"  • {source}: {count} IPs")
+                # Reset counter
+                cli.ip_generator.ip_counter = 0
                 
-                print(f"\n{Colors.OKBLUE}Suggestions:{Colors.ENDC}")
-                print(f"  • Try a more common keyword (e.g., 'google', 'amazon', 'microsoft')")
-                print(f"  • Use a company/brand name with known infrastructure")
-                print(f"  • Reduce the requested count")
-                print(f"  • Use file input method with known IPs\n")
+                generated, stats = cli.ip_generator.generate_ips_multi_keyword(keywords, target_count, country)
+                ips = list(generated)
                 
-                proceed = input(f"{Colors.BOLD}Proceed with {len(ips)} IPs? (y/n): {Colors.ENDC}").strip().lower()
-                if proceed != 'y':
-                    print(f"\n{Colors.WARNING}⚠️  Scan cancelled by user.{Colors.ENDC}")
-                    sys.exit(0)
-            else:
-                print(f"{Colors.OKGREEN}✓ Successfully generated all requested IPs{Colors.ENDC}\n")
-                print(f"{Colors.OKBLUE}Sources used:{Colors.ENDC}")
-                for source, count in source_stats.items():
-                    print(f"  • {source}: {count} IPs")
+                print(f"\n{Colors.BOLD}=== GENERATION REPORT ==={Colors.ENDC}\n")
+                print(f"{Colors.BLUE}Requested: {target_count}{Colors.ENDC}")
+                print(f"{Colors.GREEN}Generated: {len(ips)}{Colors.ENDC}\n")
+                
+                if len(ips) < target_count:
+                    print(f"{Colors.YELLOW}WARNING: Generated {len(ips)}/{target_count} IPs{Colors.ENDC}\n")
+                    
+                    if len(ips) > 0:
+                        proceed = cli.get_input(f"Proceed with {len(ips)} IPs? (y/n)", True).lower()
+                        if proceed != 'y':
+                            continue
+                    else:
+                        print(f"{Colors.RED}No IPs generated.{Colors.ENDC}")
+                        continue
             
-            if not ips:
-                cli.log("Could not generate any IPs from keyword", "ERROR")
-                sys.exit(1)
-        
-        elif method == "file":
-            ips = cli.read_ips_from_file("ips.txt")
+            elif method == "file":
+                ips = cli.read_ips_from_file("ips.txt")
+                print(f"\n{Colors.GREEN}Loaded {len(ips)} IPs{Colors.ENDC}\n")
             
-            print(f"\n{Colors.BOLD}{'═'*70}{Colors.ENDC}")
-            print(f"{Colors.BOLD}FILE INPUT SUMMARY{Colors.ENDC}")
-            print(f"{Colors.BOLD}{'═'*70}{Colors.ENDC}\n")
-            print(f"{Colors.OKGREEN}✓ Loaded IPs: {len(ips)}{Colors.ENDC}")
-            print(f"{Colors.OKBLUE}  Source: ips.txt{Colors.ENDC}\n")
+            confirm = cli.get_input(f"Scan {len(ips)} IPs? (y/n)", True).lower()
+            
+            if confirm != 'y':
+                continue
+            
+            cli.batch_scan(ips, keywords, country)
+            cli.display_results()
+            
+            if cli.results:
+                export = cli.get_input("Export? (y/n)", True).lower()
+                if export == 'y':
+                    cli.export_results()
+            
+            print(f"\n{Colors.GREEN}Scan complete!{Colors.ENDC}\n")
+            
+            another = cli.get_input("Another scan? (y/n)", False).lower()
+            if another != 'y':
+                print(f"\n{Colors.WHITE}Thank you! Goodbye.{Colors.ENDC}\n")
+                break
         
-        # Display scan configuration
-        print(f"{Colors.BOLD}{'═'*70}{Colors.ENDC}")
-        print(f"{Colors.BOLD}SCAN CONFIGURATION{Colors.ENDC}")
-        print(f"{Colors.BOLD}{'═'*70}{Colors.ENDC}\n")
-        print(f"{Colors.OKBLUE}Total IPs to scan: {len(ips)}{Colors.ENDC}")
-        print(f"{Colors.OKBLUE}Rate limit: 5 requests/second{Colors.ENDC}")
-        print(f"{Colors.OKBLUE}Scan strategy: Two-phase (liveness → deep scan){Colors.ENDC}")
-        print(f"{Colors.OKBLUE}IP order: Randomized for stealth{Colors.ENDC}\n")
-        
-        # Perform batch scan
-        cli.batch_scan(ips, keyword)
-        
-        # Display results
-        cli.display_results()
-        
-        # Export results
-        export = input(f"\n{Colors.BOLD}Export results to files? (y/n): {Colors.ENDC}").strip().lower()
-        if export == 'y':
-            cli.export_results()
-        
-        print(f"\n{Colors.OKGREEN}✅ SpiderWeb scan completed successfully!{Colors.ENDC}\n")
-    
-    except KeyboardInterrupt:
-        print(f"\n{Colors.WARNING}⚠️  Scan interrupted by user.{Colors.ENDC}")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n{Colors.FAIL}❌ Fatal error: {str(e)}{Colors.ENDC}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        except NavigationException:
+            continue
+        except ExitException:
+            print(f"\n{Colors.WHITE}Goodbye!{Colors.ENDC}")
+            break
 
 
 if __name__ == "__main__":
