@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-SpiderWeb - Advanced CLI IP Analysis Tool (Professional Edition)
+SpiderWeb Pro - Enterprise Security Intelligence Platform
 Author: g33l0
-Version: 7.0
-Description: Professional IP reconnaissance with advanced liveness detection
+Version: 2.2 - Enterprise Edition
+Description: Professional IP reconnaissance with multi-source intelligence,
+             CDN-aware classification, vulnerability assessment, and animated UI.
+
+Data Sources: DNS, URLScan, ThreatCrowd, Shodan, Censys, FOFA, ZoomEye, SecurityTrails
+
+LEGAL: Use only on authorized targets. Unauthorized scanning may be illegal.
 """
 
 import requests
@@ -13,11 +18,12 @@ import json
 import csv
 import socket
 import ssl
+import asyncio
+import aiohttp
 import concurrent.futures
 from typing import Set, List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
-from urllib.parse import quote, urlparse
 from collections import defaultdict
 import sys
 import os
@@ -25,1290 +31,2042 @@ from pathlib import Path
 import random
 import threading
 import signal
-import asyncio
-import aiohttp
-from queue import Queue
+import hashlib
+import base64
 
-# ANSI Color codes
+
+# ─────────────────────────────────────────────
+#  COLORS
+# ─────────────────────────────────────────────
 class Colors:
-    GREEN = '\033[92m'      # Hacker green
-    RED = '\033[91m'        # Red
-    WHITE = '\033[97m'      # White
-    CYAN = '\033[96m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
+    GREEN   = '\033[92m'
+    RED     = '\033[91m'
+    WHITE   = '\033[97m'
+    CYAN    = '\033[96m'
+    YELLOW  = '\033[93m'
+    BLUE    = '\033[94m'
+    MAGENTA = '\033[95m'
+    ENDC    = '\033[0m'
+    BOLD    = '\033[1m'
 
 
 class NavigationException(Exception):
-    """Exception for navigation control"""
     pass
 
 
 class ExitException(Exception):
-    """Exception for exit control"""
     pass
 
 
+# ─────────────────────────────────────────────
+#  GLOBAL CONFIG
+# ─────────────────────────────────────────────
+TIMEOUT_TCP  = 3
+TIMEOUT_HTTP = 5
+TIMEOUT_DNS  = 2
+MAX_CONCURRENT = 120
+
+# ─────────────────────────────────────────────
+#  CDN / ACCELERATOR GUARDRAILS
+#  Any IP whose ASN or PTR matches these is
+#  FORCE-classified as CDN_EDGE and exempt
+#  from vulnerability scoring.
+# ─────────────────────────────────────────────
+FORCE_CDN_ASN_NUMBERS = {
+    # Cloudflare
+    'AS13335', 'AS209242',
+    # Akamai
+    'AS16625', 'AS20940', 'AS21342', 'AS21357', 'AS34164',
+    # Fastly
+    'AS54113',
+    # AWS CloudFront / Global Accelerator
+    'AS16509', 'AS14618',
+    # StackPath
+    'AS33438',
+    # Incapsula / Imperva
+    'AS19551',
+}
+
+FORCE_CDN_PTR_PATTERNS = [
+    r'cloudflare',
+    r'cloudflare-dns',
+    r'awsglobalaccelerator\.com',
+    r'cloudfront\.net',
+    r'akamaiedge',
+    r'akamai',
+    r'fastly',
+    r'edgesuite',
+    r'edgekey',
+    r'footprint\.net',
+    r'stackpath',
+    r'incapsula',
+]
+
+# ─────────────────────────────────────────────
+#  ANIMATED SPINNER
+# ─────────────────────────────────────────────
+class Spinner:
+    """Animated 'Generating IPs, Please wait.. … .' spinner."""
+
+    FRAMES = ['   ', '.  ', '.. ', '...', ' ..', '  .']
+
+    def __init__(self, message: str = "Generating IPs, Please wait"):
+        self.message  = message
+        self.running  = False
+        self._thread  = None
+        self._idx     = 0
+
+    def _spin(self):
+        while self.running:
+            frame = self.FRAMES[self._idx % len(self.FRAMES)]
+            print(f"\r{Colors.CYAN}{self.message}{frame}{Colors.ENDC}", end='', flush=True)
+            self._idx += 1
+            time.sleep(0.35)
+
+    def start(self):
+        self.running = True
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self, final_msg: str = ""):
+        self.running = False
+        if self._thread:
+            self._thread.join()
+        # Clear spinner line
+        print(f"\r{' ' * 60}\r", end='', flush=True)
+        if final_msg:
+            print(final_msg, flush=True)
+
+
+# ─────────────────────────────────────────────
+#  DATA CLASSES
+# ─────────────────────────────────────────────
 @dataclass
-class DomainAttribution:
-    """Domain attribution data"""
-    reverse_dns: Optional[str] = None
-    tls_san_domains: List[str] = field(default_factory=list)
-    ct_log_domains: List[str] = field(default_factory=list)
-    passive_dns_domains: List[str] = field(default_factory=list)
-    all_domains: List[str] = field(default_factory=list)
+class VulnerabilityIndicators:
+    exposed_db_port:          bool = False
+    exposed_admin_port:       bool = False
+    outdated_software:        bool = False
+    missing_security_headers: bool = False
+    weak_ssl:                 bool = False
+    directory_listing:        bool = False
+    sql_error_disclosure:     bool = False
+    sql_backend_detected:     Optional[str] = None
+    risk_score:               float = 0.0
+    risk_level:               str = "MINIMAL"
+    vulnerable_services:      List[str] = field(default_factory=list)
+    recommendations:          List[str] = field(default_factory=list)
 
 
 @dataclass
-class LivenessStatus:
-    """Advanced liveness detection result"""
-    status: str = "dead"  # alive, tls_only, filtered, dead
-    tcp_responsive: bool = False
-    http_responsive: bool = False
-    https_responsive: bool = False
-    tls_handshake: bool = False
-    http_status: Optional[int] = None
-    https_status: Optional[int] = None
-    response_time: Optional[float] = None
+class ClassificationSignals:
+    asn_signal:  str   = "none"
+    asn_weight:  float = 0.0
+    rdns_signal: str   = "none"
+    rdns_weight: float = 0.0
+    port_signal: str   = "none"
+    port_weight: float = 0.0
+    cert_signal: str   = "none"
+    cert_weight: float = 0.0
+    http_signal: str   = "none"
+    http_weight: float = 0.0
 
 
 @dataclass
 class HostingClassification:
-    """Hosting type classification"""
-    hosting_type: str = "unknown"  # cdn, shared, vps, dedicated, load_balancer
-    provider: Optional[str] = None
-    confidence: float = 0.0
-    is_origin: bool = False
+    category:               str = "UNKNOWN"
+    provider:               Optional[str] = None
+    confidence:             float = 0.0
+    is_origin:              bool = False
+    is_cdn:                 bool = False
+    # Renamed from "bypass" to professional bug-bounty language
+    origin_discovery_paths: List[str] = field(default_factory=list)
+    signals:                ClassificationSignals = field(default_factory=ClassificationSignals)
+
+
+@dataclass
+class LivenessStatus:
+    status:          str = "dead"
+    tcp_responsive:  bool = False
+    http_responsive: bool = False
+    https_responsive: bool = False
+    tls_handshake:   bool = False
+    http_status:     Optional[int] = None
+    https_status:    Optional[int] = None
+    response_time:   Optional[float] = None
+    ports_scanned:   List[int] = field(default_factory=list)
+
+
+@dataclass
+class DomainAttribution:
+    reverse_dns:      Optional[str] = None
+    tls_san_domains:  List[str] = field(default_factory=list)
+    all_domains:      List[str] = field(default_factory=list)
+
+
+@dataclass
+class SSLInfo:
+    valid:   bool = False
+    issuer:  Optional[str] = None
+    subject: Optional[str] = None
+    expiry:  Optional[str] = None
+    version: Optional[str] = None
+    cipher:  Optional[str] = None
+
+
+@dataclass
+class WebInfo:
+    server:           Optional[str] = None
+    title:            Optional[str] = None
+    powered_by:       Optional[str] = None
+    security_headers: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class IPAnalysisResult:
-    """Complete IP analysis result"""
     ip: str
-    
-    # Liveness
-    liveness: LivenessStatus = field(default_factory=LivenessStatus)
-    
-    # Domain Attribution
-    domains: DomainAttribution = field(default_factory=DomainAttribution)
-    
-    # Hosting Classification
-    hosting: HostingClassification = field(default_factory=HostingClassification)
-    
-    # Network Info
+
+    liveness:    LivenessStatus        = field(default_factory=LivenessStatus)
+    domains:     DomainAttribution     = field(default_factory=DomainAttribution)
+    hosting:     HostingClassification = field(default_factory=HostingClassification)
+    vulnerability: VulnerabilityIndicators = field(default_factory=VulnerabilityIndicators)
+
     tcp_ports_open: List[int] = field(default_factory=list)
-    asn: Optional[str] = None
-    asn_org: Optional[str] = None
-    
-    # Geolocation
-    country: Optional[str] = None
+    asn:            Optional[str] = None
+    asn_org:        Optional[str] = None
+
+    country:      Optional[str] = None
     country_name: Optional[str] = None
-    city: Optional[str] = None
-    isp: Optional[str] = None
-    
-    # SSL/TLS
-    ssl_valid: bool = False
-    ssl_issuer: Optional[str] = None
-    ssl_subject: Optional[str] = None
-    
-    # Web
-    web_server: Optional[str] = None
-    web_title: Optional[str] = None
-    
-    # CDN Detection
-    is_cdn: bool = False
-    cdn_provider: Optional[str] = None
-    bypass_methods: List[str] = field(default_factory=list)
-    
-    # Metadata
-    scan_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    city:         Optional[str] = None
+    region:       Optional[str] = None
+    isp:          Optional[str] = None
+    organization: Optional[str] = None
+
+    ssl: SSLInfo = field(default_factory=SSLInfo)
+    web: WebInfo = field(default_factory=WebInfo)
+
+    detected_technologies: List[str] = field(default_factory=list)
+    data_sources:          List[str] = field(default_factory=list)
+
+    scan_timestamp:  str = field(default_factory=lambda: datetime.now().isoformat())
     source_keywords: List[str] = field(default_factory=list)
-    target_country: Optional[str] = None
-    confidence_score: float = 0.0
+    target_country:  Optional[str] = None
+    scan_id:         str = field(
+        default_factory=lambda: hashlib.md5(
+            str(datetime.now().timestamp()).encode()
+        ).hexdigest()[:8]
+    )
 
 
-class ASNCache:
-    """Thread-safe ASN cache"""
+# ─────────────────────────────────────────────
+#  API CONFIG
+# ─────────────────────────────────────────────
+class DataSourceConfig:
     def __init__(self):
-        self.cache = {}
-        self.lock = threading.Lock()
-    
-    def get(self, ip: str) -> Optional[Dict]:
-        with self.lock:
-            return self.cache.get(ip)
-    
-    def set(self, ip: str, data: Dict):
-        with self.lock:
-            self.cache[ip] = data
+        self.config_file = Path("spiderweb_config.json")
+        self.api_keys    = self._load()
+
+    def _load(self) -> Dict:
+        defaults = {
+            "shodan_api_key":       "",
+            "censys_api_id":        "",
+            "censys_api_secret":    "",
+            "fofa_email":           "",
+            "fofa_key":             "",
+            "zoomeye_api_key":      "",
+            "securitytrails_api_key": "",
+        }
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    return {**defaults, **json.load(f)}
+            except Exception:
+                pass
+        return defaults
+
+    def save(self):
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.api_keys, f, indent=2)
+        except Exception:
+            pass
+
+    def has_shodan(self)         -> bool: return bool(self.api_keys.get('shodan_api_key'))
+    def has_censys(self)         -> bool: return bool(self.api_keys.get('censys_api_id') and self.api_keys.get('censys_api_secret'))
+    def has_fofa(self)           -> bool: return bool(self.api_keys.get('fofa_email') and self.api_keys.get('fofa_key'))
+    def has_zoomeye(self)        -> bool: return bool(self.api_keys.get('zoomeye_api_key'))
+    def has_securitytrails(self) -> bool: return bool(self.api_keys.get('securitytrails_api_key'))
 
 
-class CDNDetector:
-    """Enhanced CDN/hosting detection"""
-    
-    CDN_ASN = {
-        'Cloudflare': ['AS13335', 'AS209242'],
-        'Akamai': ['AS16625', 'AS20940', 'AS21342', 'AS21357', 'AS34164'],
-        'Fastly': ['AS54113'],
-        'CloudFront': ['AS16509', 'AS14618'],
-        'StackPath': ['AS33438'],
-        'Incapsula': ['AS19551'],
-        'Sucuri': ['AS30148'],
-        'KeyCDN': ['AS30633'],
+# ─────────────────────────────────────────────
+#  CDN FORCE-CLASSIFIER
+# ─────────────────────────────────────────────
+def is_force_cdn(asn: str, ptr: str) -> bool:
+    """Return True if ASN or PTR matches known CDN / traffic-accelerator."""
+    asn_upper = (asn or '').upper()
+    for asn_num in FORCE_CDN_ASN_NUMBERS:
+        if asn_num in asn_upper:
+            return True
+
+    ptr_lower = (ptr or '').lower()
+    for pattern in FORCE_CDN_PTR_PATTERNS:
+        if re.search(pattern, ptr_lower):
+            return True
+
+    return False
+
+
+# ─────────────────────────────────────────────
+#  VULNERABILITY ASSESSOR
+#  Only runs on confirmed origin servers.
+# ─────────────────────────────────────────────
+class VulnerabilityAssessor:
+
+    DB_PORTS = {
+        3306:  'MySQL',
+        5432:  'PostgreSQL',
+        1433:  'MSSQL',
+        27017: 'MongoDB',
+        6379:  'Redis',
+        5984:  'CouchDB',
+        9200:  'Elasticsearch',
+        11211: 'Memcached',
     }
-    
-    SHARED_HOSTING = {
-        'GoDaddy': ['AS26496'],
-        'HostGator': ['AS46606'],
-        'Bluehost': ['AS46606'],
-        'SiteGround': ['AS54290'],
-        'Namecheap': ['AS22612'],
-    }
-    
-    CLOUD_PROVIDERS = {
-        'AWS': ['AS16509', 'AS14618'],
-        'Google Cloud': ['AS15169'],
-        'Azure': ['AS8075'],
-        'DigitalOcean': ['AS14061'],
-        'Linode': ['AS63949'],
-        'Vultr': ['AS20473'],
-        'OVH': ['AS16276'],
-    }
-    
-    @staticmethod
-    def classify_hosting(asn: str, asn_org: str, headers: Dict = None) -> HostingClassification:
-        """Classify hosting type with confidence score"""
-        classification = HostingClassification()
-        
-        # Check CDN
-        for provider, asn_list in CDNDetector.CDN_ASN.items():
-            if any(asn_num in asn for asn_num in asn_list):
-                classification.hosting_type = "cdn"
-                classification.provider = provider
-                classification.confidence = 0.95
-                classification.is_origin = False
-                return classification
-        
-        # Check headers for CDN
-        if headers:
-            if 'CF-RAY' in headers:
-                classification.hosting_type = "cdn"
-                classification.provider = "Cloudflare"
-                classification.confidence = 1.0
-                classification.is_origin = False
-                return classification
-            
-            if 'X-Akamai-Request-ID' in headers:
-                classification.hosting_type = "cdn"
-                classification.provider = "Akamai"
-                classification.confidence = 1.0
-                classification.is_origin = False
-                return classification
-        
-        # Check shared hosting
-        for provider, asn_list in CDNDetector.SHARED_HOSTING.items():
-            if any(asn_num in asn for asn_num in asn_list):
-                classification.hosting_type = "shared"
-                classification.provider = provider
-                classification.confidence = 0.85
-                classification.is_origin = True
-                return classification
-        
-        # Check cloud providers
-        for provider, asn_list in CDNDetector.CLOUD_PROVIDERS.items():
-            if any(asn_num in asn for asn_num in asn_list):
-                classification.hosting_type = "cloud"
-                classification.provider = provider
-                classification.confidence = 0.75
-                classification.is_origin = True
-                return classification
-        
-        # Default to VPS/Dedicated
-        classification.hosting_type = "vps_dedicated"
-        classification.confidence = 0.6
-        classification.is_origin = True
-        
-        return classification
 
+    ADMIN_PORTS = {
+        2082:  'cPanel',
+        2083:  'cPanel SSL',
+        8080:  'Admin Panel',
+        8443:  'Admin Panel SSL',
+        10000: 'Webmin',
+        2086:  'WHM',
+        2087:  'WHM SSL',
+        8081:  'Management Console',
+    }
 
-class AdvancedScanner:
-    """Advanced IP scanner with async capabilities"""
-    
-    def __init__(self, rate_limiter):
-        self.rate_limiter = rate_limiter
-        self.asn_cache = ASNCache()
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-    
-    def advanced_liveness_check(self, ip: str) -> LivenessStatus:
-        """Advanced multi-layer liveness detection"""
-        status = LivenessStatus()
-        
-        # Layer 1: TCP handshake on common ports
-        for port in [80, 443]:
-            if self._tcp_handshake(ip, port):
-                status.tcp_responsive = True
+    REQUIRED_HEADERS = [
+        'Strict-Transport-Security',
+        'X-Frame-Options',
+        'X-Content-Type-Options',
+        'Content-Security-Policy',
+    ]
+
+    OUTDATED_SIGNATURES = [
+        r'Apache/2\.[0-2]',
+        r'nginx/1\.[0-9]\.',
+        r'PHP/5\.',
+        r'PHP/7\.[0-2]',
+        r'IIS/[6-8]\.',
+    ]
+
+    @classmethod
+    def assess(cls, result: IPAnalysisResult,
+               response_headers: Dict = None,
+               response_body:    str  = None) -> VulnerabilityIndicators:
+        """
+        Assess ONLY if the IP is a confirmed origin server.
+        CDN_EDGE IPs always get MINIMAL risk.
+        """
+        vuln = VulnerabilityIndicators()
+
+        # ── CDN / accelerator guard ──────────────────────────────────────
+        if result.hosting.is_cdn or result.hosting.category == "CDN_EDGE":
+            vuln.risk_score = 0.0
+            vuln.risk_level = "MINIMAL"
+            return vuln
+
+        risk_factors = []
+
+        # Exposed database ports
+        for port, db_name in cls.DB_PORTS.items():
+            if port in result.tcp_ports_open:
+                vuln.exposed_db_port = True
+                vuln.sql_backend_detected = db_name
+                vuln.vulnerable_services.append(f"{db_name} (Port {port})")
+                risk_factors.append(3.0)
+                vuln.recommendations.append(
+                    f"Bind {db_name} on port {port} to localhost; block external access via firewall."
+                )
+
+        # Exposed admin ports
+        for port, service in cls.ADMIN_PORTS.items():
+            if port in result.tcp_ports_open:
+                vuln.exposed_admin_port = True
+                vuln.vulnerable_services.append(f"{service} (Port {port})")
+                risk_factors.append(2.5)
+                vuln.recommendations.append(
+                    f"Restrict {service} (port {port}) with IP allowlist or VPN."
+                )
+
+        # Security headers
+        if response_headers:
+            missing = [h for h in cls.REQUIRED_HEADERS if h not in response_headers]
+            if missing:
+                vuln.missing_security_headers = True
+                risk_factors.append(1.5)
+                vuln.recommendations.append(
+                    f"Add missing headers: {', '.join(missing[:3])}"
+                )
+
+        # Outdated software
+        server = result.web.server or ''
+        for pattern in cls.OUTDATED_SIGNATURES:
+            if re.search(pattern, server, re.IGNORECASE):
+                vuln.outdated_software = True
+                risk_factors.append(2.0)
+                vuln.recommendations.append("Update web server to latest stable version.")
                 break
-        
+
+        # Weak TLS
+        if result.ssl.valid and result.ssl.version:
+            if 'TLSv1' in result.ssl.version and 'TLSv1.3' not in result.ssl.version:
+                vuln.weak_ssl = True
+                risk_factors.append(1.8)
+                vuln.recommendations.append("Upgrade to TLS 1.2+ and disable TLS 1.0/1.1.")
+
+        # SQL error disclosure
+        if response_body:
+            sql_error_patterns = [
+                r'SQL syntax.*MySQL', r'Warning.*mysql_', r'valid MySQL result',
+                r'MySqlClient\.', r'PostgreSQL.*ERROR', r'Warning.*pg_',
+                r'valid PostgreSQL result', r'Npgsql\.',
+                r'Driver.*SQL Server', r'OLE DB.*SQL Server',
+                r'SQLServer JDBC Driver', r'SqlException',
+            ]
+            for pattern in sql_error_patterns:
+                if re.search(pattern, response_body[:2000], re.IGNORECASE):
+                    vuln.sql_error_disclosure = True
+                    risk_factors.append(3.5)
+                    vuln.vulnerable_services.append("SQL Error Disclosure in HTTP Response")
+                    vuln.recommendations.append(
+                        "Disable verbose database error messages in production."
+                    )
+                    break
+
+        # Score & level
+        vuln.risk_score = min(10.0, sum(risk_factors)) if risk_factors else 0.0
+
+        if vuln.risk_score >= 7.0:
+            vuln.risk_level = "CRITICAL"
+        elif vuln.risk_score >= 5.0:
+            vuln.risk_level = "HIGH"
+        elif vuln.risk_score >= 3.0:
+            vuln.risk_level = "MEDIUM"
+        elif vuln.risk_score >= 1.0:
+            vuln.risk_level = "LOW"
+        else:
+            vuln.risk_level = "MINIMAL"
+
+        return vuln
+
+
+# ─────────────────────────────────────────────
+#  CLASSIFICATION ENGINE
+# ─────────────────────────────────────────────
+class ClassificationEngine:
+
+    CDN_ASN = {
+        'Cloudflare':  ['AS13335', 'AS209242'],
+        'Akamai':      ['AS16625', 'AS20940', 'AS21342', 'AS21357', 'AS34164'],
+        'Fastly':      ['AS54113'],
+        'CloudFront':  ['AS16509', 'AS14618'],
+        'StackPath':   ['AS33438'],
+        'Incapsula':   ['AS19551'],
+    }
+
+    CLOUD_ASN = {
+        'AWS':          ['AS16509', 'AS14618', 'AS8987'],
+        'Google Cloud': ['AS15169', 'AS36040', 'AS396982'],
+        'Azure':        ['AS8075', 'AS8068'],
+        'DigitalOcean': ['AS14061'],
+        'Linode':       ['AS63949'],
+        'Vultr':        ['AS20473'],
+        'OVH':          ['AS16276'],
+        'Hetzner':      ['AS24940'],
+    }
+
+    MANAGED_HOSTING = {
+        'Squarespace': ['AS46652'],
+        'Wix':         ['AS58182'],
+        'Shopify':     ['AS55429'],
+        'WordPress.com': ['AS2635'],
+    }
+
+    # IONOS (AS8560) and Newfold / Endurance (AS46606, AS26496) treated as SHARED
+    SHARED_HOSTING = {
+        'GoDaddy':   ['AS26496'],
+        'HostGator': ['AS46606'],
+        'Bluehost':  ['AS46606'],
+        'Namecheap': ['AS22612'],
+        'IONOS':     ['AS8560'],
+        'DreamHost': ['AS26347'],
+        'Newfold':   ['AS46606', 'AS26496'],
+    }
+
+    RDNS_PATTERNS = {
+        'cdn':           [r'cloudflare', r'cloudfront', r'akamai', r'fastly', r'cdn', r'cache',
+                          r'awsglobalaccelerator', r'edgesuite', r'edgekey'],
+        'cloud_frontend':[r'1e100\.net', r'googleusercontent', r'compute\.amazonaws'],
+        'cloud_compute': [r'ec2', r'\.compute\.', r'azure', r'cloud'],
+        'shared':        [r'shared', r'cpanel', r'plesk', r'directadmin',
+                          r'host\d+', r'server\d+'],
+    }
+
+    # Origin discovery paths (professional bug-bounty language)
+    ORIGIN_DISCOVERY = {
+        'Cloudflare': [
+            'DNS History via SecurityTrails / ViewDNS',
+            'Subdomain enumeration (mail., ftp., direct., origin., cpanel.)',
+            'Certificate Transparency logs (crt.sh)',
+            'IPv6 address lookup (may bypass CDN)',
+            'MX record IP lookup',
+        ],
+        'Akamai': [
+            'Origin header injection test',
+            'Subdomain scanning for non-proxied assets',
+            'Historical DNS records',
+        ],
+        'Fastly': [
+            'Subdomain enumeration',
+            'DNS history lookup',
+        ],
+        'CloudFront': [
+            'S3 bucket origin enumeration',
+            'Historical DNS / ELB endpoint discovery',
+        ],
+    }
+
+    @classmethod
+    def classify(cls, asn: str, asn_org: str, reverse_dns: str,
+                 ports: List[int], ssl_valid: bool, http_responsive: bool,
+                 headers: Dict = None) -> HostingClassification:
+
+        signals = ClassificationSignals()
+
+        # ── FORCE CDN check (highest priority) ──────────────────────────
+        if is_force_cdn(asn, reverse_dns):
+            provider = cls._detect_cdn_provider(asn, reverse_dns)
+            paths    = cls.ORIGIN_DISCOVERY.get(provider, ['DNS history', 'Subdomain enumeration'])
+            return HostingClassification(
+                category              = "CDN_EDGE",
+                provider              = provider,
+                confidence            = 1.0,
+                is_origin             = False,
+                is_cdn                = True,
+                origin_discovery_paths= paths,
+                signals               = signals,
+            )
+
+        # ── ASN analysis ─────────────────────────────────────────────────
+        asn_cat, asn_provider, asn_w = cls._analyze_asn(asn)
+        signals.asn_signal = asn_cat
+        signals.asn_weight = asn_w
+
+        # ── Reverse DNS ──────────────────────────────────────────────────
+        rdns_cat, rdns_w = cls._analyze_rdns(reverse_dns)
+        signals.rdns_signal = rdns_cat
+        signals.rdns_weight = rdns_w
+
+        # ── Ports ────────────────────────────────────────────────────────
+        port_cat, port_w = cls._analyze_ports(ports)
+        signals.port_signal = port_cat
+        signals.port_weight = port_w
+
+        # ── SSL / HTTP ───────────────────────────────────────────────────
+        if ssl_valid:
+            signals.cert_signal = "valid"
+            signals.cert_weight = 0.15
+        if http_responsive:
+            signals.http_signal = "responsive"
+            signals.http_weight = 0.10
+
+        # ── CDN header check ─────────────────────────────────────────────
+        cdn_headers_present = False
+        if headers:
+            cdn_h = ['CF-RAY', 'X-Akamai-Request-ID', 'X-Cache', 'X-Fastly-Request-ID',
+                     'X-Amz-Cf-Id']
+            cdn_headers_present = any(h in headers for h in cdn_h)
+
+        if asn_cat == "cdn" or rdns_cat == "cdn" or cdn_headers_present:
+            provider = asn_provider or cls._detect_cdn_provider(asn, reverse_dns)
+            conf     = min(1.0, asn_w + rdns_w + (0.2 if cdn_headers_present else 0))
+            paths    = cls.ORIGIN_DISCOVERY.get(provider, ['DNS history', 'Subdomain enumeration'])
+            if conf >= 0.60:
+                return HostingClassification(
+                    category               = "CDN_EDGE",
+                    provider               = provider,
+                    confidence             = conf,
+                    is_origin              = False,
+                    is_cdn                 = True,
+                    origin_discovery_paths = paths,
+                    signals                = signals,
+                )
+
+        # ── Cloud Frontend ───────────────────────────────────────────────
+        if rdns_cat == "cloud_frontend":
+            conf = rdns_w + signals.cert_weight + signals.http_weight
+            if conf >= 0.75:
+                return HostingClassification(
+                    category="CLOUD_FRONTEND", provider=asn_provider,
+                    confidence=conf, is_origin=True, is_cdn=False, signals=signals,
+                )
+
+        # ── Cloud Compute ────────────────────────────────────────────────
+        if asn_cat == "cloud" or rdns_cat == "cloud_compute":
+            pos  = asn_w + rdns_w + signals.cert_weight
+            neg  = signals.port_weight * 0.3 if port_cat == "shared" else 0
+            conf = pos - neg
+            if conf >= 0.75:
+                return HostingClassification(
+                    category="CLOUD_COMPUTE", provider=asn_provider,
+                    confidence=conf, is_origin=True, is_cdn=False, signals=signals,
+                )
+
+        # ── Managed Hosting ──────────────────────────────────────────────
+        if asn_cat == "managed":
+            conf = asn_w + signals.cert_weight + signals.http_weight
+            if conf >= 0.75:
+                return HostingClassification(
+                    category="MANAGED_HOSTING", provider=asn_provider,
+                    confidence=conf, is_origin=True, is_cdn=False, signals=signals,
+                )
+
+        # ── Shared Hosting ───────────────────────────────────────────────
+        shared_signals = sum([
+            asn_cat == "shared",
+            rdns_cat == "shared",
+            port_cat == "shared",
+        ])
+        if shared_signals >= 1:
+            conf = min(1.0, asn_w + rdns_w + signals.port_weight)
+            if conf >= 0.70 or asn_cat == "shared":
+                return HostingClassification(
+                    category="SHARED_HOSTING", provider=asn_provider,
+                    confidence=max(conf, asn_w), is_origin=True, is_cdn=False, signals=signals,
+                )
+
+        # ── Dedicated / VPS ──────────────────────────────────────────────
+        if asn_cat in ("generic", "none") and rdns_cat in ("generic", "none") and port_cat == "dedicated":
+            conf = (signals.port_weight + signals.cert_weight + signals.http_weight) / 0.75
+            if conf >= 0.75:
+                return HostingClassification(
+                    category="DEDICATED_VPS", provider=None,
+                    confidence=conf, is_origin=True, is_cdn=False, signals=signals,
+                )
+
+        return HostingClassification(
+            category="UNKNOWN", confidence=0.0, is_origin=False, is_cdn=False, signals=signals,
+        )
+
+    @classmethod
+    def _detect_cdn_provider(cls, asn: str, ptr: str) -> str:
+        asn_u = (asn or '').upper()
+        ptr_l = (ptr or '').lower()
+        if 'AS13335' in asn_u or 'AS209242' in asn_u or 'cloudflare' in ptr_l:
+            return 'Cloudflare'
+        if any(a in asn_u for a in ['AS16625', 'AS20940', 'AS21342']) or 'akamai' in ptr_l:
+            return 'Akamai'
+        if 'AS54113' in asn_u or 'fastly' in ptr_l:
+            return 'Fastly'
+        if 'AS16509' in asn_u or 'AS14618' in asn_u or 'cloudfront' in ptr_l or 'awsglobal' in ptr_l:
+            return 'CloudFront'
+        if 'AS33438' in asn_u or 'stackpath' in ptr_l:
+            return 'StackPath'
+        if 'AS19551' in asn_u or 'incapsula' in ptr_l:
+            return 'Incapsula'
+        return 'CDN'
+
+    @classmethod
+    def _analyze_asn(cls, asn: str) -> Tuple[str, Optional[str], float]:
+        if not asn:
+            return "none", None, 0.0
+        for provider, asn_list in cls.CDN_ASN.items():
+            if any(a in asn for a in asn_list):
+                return "cdn", provider, 1.0
+        for provider, asn_list in cls.CLOUD_ASN.items():
+            if any(a in asn for a in asn_list):
+                return "cloud", provider, 0.85
+        for provider, asn_list in cls.MANAGED_HOSTING.items():
+            if any(a in asn for a in asn_list):
+                return "managed", provider, 0.90
+        for provider, asn_list in cls.SHARED_HOSTING.items():
+            if any(a in asn for a in asn_list):
+                return "shared", provider, 0.85
+        return "generic", None, 0.0
+
+    @classmethod
+    def _analyze_rdns(cls, rdns: str) -> Tuple[str, float]:
+        if not rdns:
+            return "none", 0.0
+        r = rdns.lower()
+        for p in cls.RDNS_PATTERNS['cdn']:
+            if re.search(p, r):
+                return "cdn", 0.90
+        for p in cls.RDNS_PATTERNS['cloud_frontend']:
+            if re.search(p, r):
+                return "cloud_frontend", 0.80
+        for p in cls.RDNS_PATTERNS['cloud_compute']:
+            if re.search(p, r):
+                return "cloud_compute", 0.75
+        for p in cls.RDNS_PATTERNS['shared']:
+            if re.search(p, r):
+                return "shared", 0.80
+        return "generic", 0.0
+
+    @classmethod
+    def _analyze_ports(cls, ports: List[int]) -> Tuple[str, float]:
+        if not ports:
+            return "none", 0.0
+        if 21 in ports and 3306 in ports:
+            return "shared", 0.70
+        if any(p in ports for p in [2082, 2083, 10000]):
+            return "shared", 0.75
+        if 22 in ports and 21 not in ports and 3306 not in ports:
+            return "dedicated", 0.50
+        return "generic", 0.0
+
+
+# ─────────────────────────────────────────────
+#  ASYNC CACHE
+# ─────────────────────────────────────────────
+class AsyncCache:
+    def __init__(self):
+        self._asn  = {}
+        self._rdns = {}
+        self._lock = threading.Lock()
+
+    def get_asn(self, ip: str) -> Optional[Dict]:
+        with self._lock: return self._asn.get(ip)
+
+    def set_asn(self, ip: str, d: Dict):
+        with self._lock: self._asn[ip] = d
+
+    def get_rdns(self, ip: str) -> Optional[str]:
+        with self._lock: return self._rdns.get(ip)
+
+    def set_rdns(self, ip: str, v: str):
+        with self._lock: self._rdns[ip] = v
+
+
+# ─────────────────────────────────────────────
+#  ASYNC SCANNER
+# ─────────────────────────────────────────────
+class AsyncScanner:
+    def __init__(self):
+        self.cache   = AsyncCache()
+        self.session = None
+
+    async def init_session(self):
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT_HTTP)
+        )
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+
+    # ── Main entry per IP ───────────────────────────────────────────────
+    async def scan_ip(self, ip: str,
+                      keywords:     List[str]    = None,
+                      country_code: Optional[str] = None) -> IPAnalysisResult:
+        result = IPAnalysisResult(
+            ip=ip,
+            source_keywords=keywords or [],
+            target_country=country_code,
+        )
+
+        try:
+            # Phase 1: liveness
+            result.liveness = await self._check_liveness(ip)
+            if result.liveness.status == "dead":
+                return result
+
+            # Phase 2: port scan
+            if result.liveness.tcp_responsive:
+                result.tcp_ports_open = await self._scan_ports(ip)
+                result.liveness.ports_scanned = [21, 22, 25, 80, 443, 3306, 5432,
+                                                  1433, 27017, 6379, 8080, 8443,
+                                                  2082, 2083]
+
+            # Phase 3: concurrent data gathering
+            tasks = [
+                self._get_asn(ip),
+                self._get_reverse_dns(ip),
+                self._get_geolocation(ip),
+            ]
+
+            response_headers: Dict = {}
+            response_body:    str  = ""
+
+            if 443 in result.tcp_ports_open or 80 in result.tcp_ports_open:
+                tasks.append(self._get_ssl_info(ip))
+                tasks.append(self._get_web_info(ip))
+
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+            asn_data = gathered[0] if not isinstance(gathered[0], Exception) else {}
+            rdns     = gathered[1] if not isinstance(gathered[1], Exception) else None
+            geo      = gathered[2] if not isinstance(gathered[2], Exception) else {}
+
+            result.asn          = asn_data.get('asn')
+            result.asn_org      = asn_data.get('org')
+            result.domains.reverse_dns = rdns
+            result.country      = geo.get('country')
+            result.country_name = geo.get('country_name')
+            result.city         = geo.get('city')
+            result.region       = geo.get('region')
+            result.isp          = geo.get('isp')
+            result.organization = geo.get('org')
+
+            if len(gathered) > 3 and not isinstance(gathered[3], Exception):
+                ssl_info          = gathered[3]
+                result.ssl.valid  = ssl_info.get('valid', False)
+                result.ssl.issuer = ssl_info.get('issuer')
+                result.ssl.subject= ssl_info.get('subject')
+                result.ssl.expiry = ssl_info.get('expiry')
+                result.ssl.version= ssl_info.get('version')
+                result.ssl.cipher = ssl_info.get('cipher')
+
+            if len(gathered) > 4 and not isinstance(gathered[4], Exception):
+                web_info              = gathered[4]
+                result.web.server     = web_info.get('server')
+                result.web.title      = web_info.get('title')
+                result.web.powered_by = web_info.get('powered_by')
+                result.web.security_headers = web_info.get('security_headers', {})
+                response_headers      = web_info.get('headers', {})
+                response_body         = web_info.get('body', '')
+                result.detected_technologies = self._detect_technologies(
+                    response_body, response_headers
+                )
+
+            # Phase 4: classification (CDN force-check happens inside)
+            result.hosting = ClassificationEngine.classify(
+                result.asn or '',
+                result.asn_org or '',
+                result.domains.reverse_dns or '',
+                result.tcp_ports_open,
+                result.ssl.valid,
+                result.liveness.http_responsive or result.liveness.https_responsive,
+                response_headers,
+            )
+
+            # Phase 5: vulnerability assessment (ONLY for non-CDN origins)
+            result.vulnerability = VulnerabilityAssessor.assess(
+                result, response_headers, response_body
+            )
+
+            # Phase 6: domain attribution (origin only)
+            if result.hosting.is_origin and not result.hosting.is_cdn:
+                san = await self._get_san_domains(ip)
+                result.domains.tls_san_domains = san
+                all_d = set()
+                if rdns:
+                    all_d.add(rdns)
+                all_d.update(san)
+                result.domains.all_domains = sorted(all_d)
+
+        except Exception:
+            pass
+
+        return result
+
+    # ── TCP connect ─────────────────────────────────────────────────────
+    async def _tcp_connect(self, ip: str, port: int) -> bool:
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=TIMEOUT_TCP
+            )
+            w.close()
+            await w.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    # ── Liveness ────────────────────────────────────────────────────────
+    async def _check_liveness(self, ip: str) -> LivenessStatus:
+        status = LivenessStatus()
+
+        tcp80  = await self._tcp_connect(ip, 80)
+        tcp443 = await self._tcp_connect(ip, 443)
+        status.tcp_responsive = tcp80 or tcp443
+
         if not status.tcp_responsive:
             status.status = "dead"
             return status
-        
-        # Layer 2: HTTP/HTTPS check
-        http_ok, http_code, http_time = self._http_check(ip)
-        https_ok, https_code, https_time, tls_ok = self._https_check_with_tls(ip)
-        
-        status.http_responsive = http_ok
-        status.https_responsive = https_ok
-        status.tls_handshake = tls_ok
-        status.http_status = http_code
-        status.https_status = https_code
-        status.response_time = https_time or http_time
-        
-        # Classification
-        if http_ok or https_ok:
+
+        checks = []
+        if tcp80:  checks.append(self._http_check(ip, False))
+        if tcp443: checks.append(self._http_check(ip, True))
+
+        results = await asyncio.gather(*checks, return_exceptions=True)
+        for res in results:
+            if not isinstance(res, dict):
+                continue
+            if res.get('https'):
+                status.https_responsive = res.get('success', False)
+                status.https_status     = res.get('status')
+                status.tls_handshake    = res.get('tls', False)
+                status.response_time    = res.get('time')
+            else:
+                status.http_responsive = res.get('success', False)
+                status.http_status     = res.get('status')
+                if not status.response_time:
+                    status.response_time = res.get('time')
+
+        if status.http_responsive or status.https_responsive:
             status.status = "alive"
-        elif tls_ok:
+        elif status.tls_handshake:
             status.status = "tls_only"
         elif status.tcp_responsive:
             status.status = "filtered"
         else:
             status.status = "dead"
-        
+
         return status
-    
-    def _tcp_handshake(self, ip: str, port: int, timeout: int = 3) -> bool:
-        """Perform TCP handshake"""
+
+    # ── HTTP check ──────────────────────────────────────────────────────
+    async def _http_check(self, ip: str, https: bool) -> Dict:
+        proto  = "https" if https else "http"
+        result = {'https': https, 'success': False, 'status': None, 'time': None, 'tls': False}
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((ip, port))
-            sock.close()
-            return result == 0
-        except:
-            return False
-    
-    def _http_check(self, ip: str) -> Tuple[bool, Optional[int], Optional[float]]:
-        """HTTP check"""
-        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            conn = aiohttp.TCPConnector(ssl=ctx if https else None)
             start = time.time()
-            response = self.session.head(f"http://{ip}", timeout=5, allow_redirects=True)
-            elapsed = time.time() - start
-            return True, response.status_code, elapsed
-        except:
-            return False, None, None
-    
-    def _https_check_with_tls(self, ip: str) -> Tuple[bool, Optional[int], Optional[float], bool]:
-        """HTTPS check with TLS handshake and SNI"""
-        tls_ok = False
-        
-        # Try TLS handshake with SNI
-        try:
-            context = ssl.create_default_context()
-            with socket.create_connection((ip, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=ip) as ssock:
-                    tls_ok = True
-        except:
-            pass
-        
-        # Try HTTPS request
-        try:
-            start = time.time()
-            response = self.session.head(f"https://{ip}", timeout=5, verify=False, allow_redirects=True)
-            elapsed = time.time() - start
-            return True, response.status_code, elapsed, tls_ok
-        except:
-            return False, None, None, tls_ok
-    
-    def get_domain_attribution(self, ip: str) -> DomainAttribution:
-        """Get all associated domains"""
-        domains = DomainAttribution()
-        all_found = set()
-        
-        # Reverse DNS
-        try:
-            reverse = socket.gethostbyaddr(ip)[0]
-            domains.reverse_dns = reverse
-            all_found.add(reverse)
-        except:
-            pass
-        
-        # TLS certificate SAN
-        try:
-            san_domains = self._get_tls_san_domains(ip)
-            domains.tls_san_domains = san_domains
-            all_found.update(san_domains)
-        except:
-            pass
-        
-        # Certificate Transparency
-        try:
-            ct_domains = self._get_ct_log_domains(ip)
-            domains.ct_log_domains = ct_domains
-            all_found.update(ct_domains)
-        except:
-            pass
-        
-        domains.all_domains = sorted(list(all_found))
-        return domains
-    
-    def _get_tls_san_domains(self, ip: str) -> List[str]:
-        """Extract SAN domains from TLS certificate"""
-        domains = []
-        try:
-            context = ssl.create_default_context()
-            with socket.create_connection((ip, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=ip) as ssock:
-                    cert = ssock.getpeercert()
-                    
-                    # Get SAN
-                    if 'subjectAltName' in cert:
-                        for entry in cert['subjectAltName']:
-                            if entry[0] == 'DNS':
-                                domain = entry[1].replace('*.', '')
-                                domains.append(domain)
-                    
-                    # Get CN
-                    if 'subject' in cert:
-                        for rdn in cert['subject']:
-                            for name, value in rdn:
-                                if name == 'commonName':
-                                    cn = value.replace('*.', '')
-                                    if cn not in domains:
-                                        domains.append(cn)
-        except:
-            pass
-        
-        return domains[:20]  # Limit to 20 domains
-    
-    def _get_ct_log_domains(self, ip: str) -> List[str]:
-        """Get domains from Certificate Transparency logs"""
-        domains = []
-        
-        try:
-            # Use crt.sh
-            url = f"https://crt.sh/?q={ip}&output=json"
-            response = self.session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for entry in data[:50]:  # Limit
-                    name_value = entry.get('name_value', '')
-                    for domain in name_value.split('\n'):
-                        domain = domain.strip().replace('*.', '')
-                        if domain and domain not in domains:
-                            domains.append(domain)
-        except:
-            pass
-        
-        return domains[:20]
-    
-    def get_asn_info(self, ip: str) -> Tuple[Optional[str], Optional[str]]:
-        """Get ASN and organization (with caching)"""
-        cached = self.asn_cache.get(ip)
-        if cached:
-            return cached.get('asn'), cached.get('org')
-        
-        try:
-            self.rate_limiter.wait()
-            url = f"http://ip-api.com/json/{ip}?fields=as"
-            response = self.session.get(url, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                asn_full = data.get('as', '')
-                
-                if asn_full:
-                    parts = asn_full.split(' ', 1)
-                    asn = parts[0] if parts else ''
-                    org = parts[1] if len(parts) > 1 else ''
-                    
-                    result = {'asn': asn, 'org': org}
-                    self.asn_cache.set(ip, result)
-                    return asn, org
-        except:
-            pass
-        
-        return None, None
-    
-    def comprehensive_scan(self, ip: str, keywords: List[str] = None, 
-                          country_code: Optional[str] = None) -> IPAnalysisResult:
-        """Comprehensive IP analysis"""
-        result = IPAnalysisResult(ip=ip, source_keywords=keywords or [], target_country=country_code)
-        
-        try:
-            # Liveness detection
-            result.liveness = self.advanced_liveness_check(ip)
-            
-            if result.liveness.status == "dead":
-                result.confidence_score = 1.0
-                return result
-            
-            # Port scan (limited)
-            open_ports = []
-            for port in [80, 443, 22, 21, 25, 3306, 8080]:
-                if self._tcp_handshake(ip, port, timeout=1):
-                    open_ports.append(port)
-                time.sleep(0.05)
-            
-            result.tcp_ports_open = open_ports
-            
-            # ASN lookup
-            asn, asn_org = self.get_asn_info(ip)
-            result.asn = asn
-            result.asn_org = asn_org
-            
-            # Geolocation
-            try:
-                self.rate_limiter.wait()
-                geo = self._get_geolocation(ip)
-                result.country = geo.get('country')
-                result.country_name = geo.get('country_name')
-                result.city = geo.get('city')
-                result.isp = geo.get('isp')
-            except:
-                pass
-            
-            # Get headers for classification
-            headers = {}
-            try:
-                protocol = "https" if result.liveness.https_responsive else "http"
-                response = self.session.head(f"{protocol}://{ip}", timeout=5, verify=False, allow_redirects=True)
-                headers = dict(response.headers)
-                result.web_server = headers.get('Server', 'Unknown')
-            except:
-                pass
-            
-            # Hosting classification
-            if asn:
-                result.hosting = CDNDetector.classify_hosting(asn, asn_org or '', headers)
-                result.is_cdn = result.hosting.hosting_type == "cdn"
-                result.cdn_provider = result.hosting.provider if result.is_cdn else None
-            
-            # Domain attribution (only for origin servers or if explicitly needed)
-            if result.hosting.is_origin or result.liveness.status == "alive":
-                result.domains = self.get_domain_attribution(ip)
-            
-            # SSL check
-            if result.liveness.tls_handshake or result.liveness.https_responsive:
-                try:
-                    ssl_info = self._get_ssl_info(ip)
-                    result.ssl_valid = ssl_info.get('valid', False)
-                    result.ssl_issuer = ssl_info.get('issuer')
-                    result.ssl_subject = ssl_info.get('subject')
-                except:
-                    pass
-            
-            # Web title
-            if result.liveness.status == "alive":
-                try:
-                    result.web_title = self._get_web_title(ip)
-                except:
-                    pass
-            
-            # Calculate confidence score
-            result.confidence_score = self._calculate_confidence(result)
-        
+            async with aiohttp.ClientSession(
+                connector=conn,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT_HTTP)
+            ) as sess:
+                async with sess.head(f"{proto}://{ip}", allow_redirects=True) as resp:
+                    result['success'] = True
+                    result['status']  = resp.status
+                    result['time']    = time.time() - start
+                    result['tls']     = https
         except Exception:
             pass
-        
         return result
-    
-    def _get_geolocation(self, ip: str) -> Dict:
-        """Get geolocation"""
+
+    # ── Port scan ────────────────────────────────────────────────────────
+    async def _scan_ports(self, ip: str) -> List[int]:
+        ports = [21, 22, 25, 80, 443, 3306, 5432, 1433, 27017, 6379, 8080, 8443, 2082, 2083]
+        tasks = [self._tcp_connect(ip, p) for p in ports]
+        res   = await asyncio.gather(*tasks)
+        return [p for p, open_ in zip(ports, res) if open_]
+
+    # ── ASN ──────────────────────────────────────────────────────────────
+    async def _get_asn(self, ip: str) -> Dict:
+        cached = self.cache.get_asn(ip)
+        if cached:
+            return cached
         try:
-            url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp"
-            response = self.session.get(url, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success':
-                    return {
-                        'country': data.get('countryCode'),
-                        'country_name': data.get('country'),
-                        'city': data.get('city'),
-                        'isp': data.get('isp')
-                    }
-        except:
+            url = f"http://ip-api.com/json/{ip}?fields=as"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT_DNS)) as r:
+                if r.status == 200:
+                    data     = await r.json()
+                    asn_full = data.get('as', '')
+                    if asn_full:
+                        parts = asn_full.split(' ', 1)
+                        d = {'asn': parts[0], 'org': parts[1] if len(parts) > 1 else ''}
+                        self.cache.set_asn(ip, d)
+                        return d
+        except Exception:
             pass
-        
         return {}
-    
-    def _get_ssl_info(self, ip: str) -> Dict:
-        """Get SSL certificate info"""
-        ssl_info = {}
-        
+
+    # ── Reverse DNS ──────────────────────────────────────────────────────
+    async def _get_reverse_dns(self, ip: str) -> Optional[str]:
+        cached = self.cache.get_rdns(ip)
+        if cached:
+            return cached
         try:
-            context = ssl.create_default_context()
-            with socket.create_connection((ip, 443), timeout=3) as sock:
-                with context.wrap_socket(sock, server_hostname=ip) as ssock:
-                    cert = ssock.getpeercert()
-                    
-                    ssl_info['valid'] = True
-                    
-                    if 'issuer' in cert:
-                        issuer = dict(x[0] for x in cert['issuer'])
-                        ssl_info['issuer'] = issuer.get('organizationName', 'Unknown')
-                    
-                    if 'subject' in cert:
-                        subject = dict(x[0] for x in cert['subject'])
-                        ssl_info['subject'] = subject.get('commonName', 'Unknown')
-        except:
-            ssl_info['valid'] = False
-        
-        return ssl_info
-    
-    def _get_web_title(self, ip: str) -> Optional[str]:
-        """Get web page title"""
+            loop  = asyncio.get_event_loop()
+            rdns  = await asyncio.wait_for(
+                loop.run_in_executor(None, socket.gethostbyaddr, ip),
+                timeout=TIMEOUT_DNS
+            )
+            name = rdns[0]
+            self.cache.set_rdns(ip, name)
+            return name
+        except Exception:
+            return None
+
+    # ── Geolocation ──────────────────────────────────────────────────────
+    async def _get_geolocation(self, ip: str) -> Dict:
         try:
-            protocol = "https" if self._tcp_handshake(ip, 443, 1) else "http"
-            response = self.session.get(f"{protocol}://{ip}", timeout=5, verify=False, stream=True)
-            
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(response.content[:2048], 'html.parser')
-            if soup.title and soup.title.string:
-                return soup.title.string.strip()[:100]
-        except:
+            url = (f"http://ip-api.com/json/{ip}"
+                   f"?fields=status,country,countryCode,region,regionName,city,isp,org")
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT_DNS)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    if d.get('status') == 'success':
+                        return {
+                            'country':      d.get('countryCode'),
+                            'country_name': d.get('country'),
+                            'city':         d.get('city'),
+                            'region':       d.get('regionName'),
+                            'isp':          d.get('isp'),
+                            'org':          d.get('org'),
+                        }
+        except Exception:
             pass
-        
-        return None
-    
-    def _calculate_confidence(self, result: IPAnalysisResult) -> float:
-        """Calculate confidence score for classification"""
-        score = 0.0
-        
-        # Base score from hosting classification
-        score = result.hosting.confidence
-        
-        # Boost for origin servers with domains
-        if result.hosting.is_origin and result.domains.all_domains:
-            score = min(1.0, score + 0.1)
-        
-        # Boost for valid SSL
-        if result.ssl_valid:
-            score = min(1.0, score + 0.05)
-        
-        # Penalize if CDN
-        if result.is_cdn:
-            score = max(0.0, score - 0.2)
-        
-        return round(score, 2)
+        return {}
+
+    # ── SSL info ─────────────────────────────────────────────────────────
+    async def _get_ssl_info(self, ip: str) -> Dict:
+        info: Dict = {'valid': False}
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _fetch():
+                ctx = ssl.create_default_context()
+                with socket.create_connection((ip, 443), timeout=TIMEOUT_TCP) as s:
+                    with ctx.wrap_socket(s, server_hostname=ip) as ss:
+                        return ss.getpeercert(), ss.version(), ss.cipher()
+
+            cert, version, cipher = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch), timeout=TIMEOUT_TCP
+            )
+            info['valid']  = True
+            info['version']= version
+            info['cipher'] = cipher[0] if cipher else None
+
+            if 'issuer' in cert:
+                issuer_d = dict(x[0] for x in cert['issuer'])
+                info['issuer'] = issuer_d.get('organizationName', 'Unknown')
+
+            if 'subject' in cert:
+                subj_d = dict(x[0] for x in cert['subject'])
+                info['subject'] = subj_d.get('commonName', 'Unknown')
+
+            if 'notAfter' in cert:
+                info['expiry'] = cert['notAfter']
+        except Exception:
+            pass
+        return info
+
+    # ── Web info ─────────────────────────────────────────────────────────
+    async def _get_web_info(self, ip: str) -> Dict:
+        info: Dict = {}
+        try:
+            use_https = await self._tcp_connect(ip, 443)
+            proto     = "https" if use_https else "http"
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            conn = aiohttp.TCPConnector(ssl=ctx)
+
+            async with aiohttp.ClientSession(
+                connector=conn,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT_HTTP)
+            ) as sess:
+                async with sess.get(f"{proto}://{ip}", allow_redirects=True) as resp:
+                    info['server']     = resp.headers.get('Server')
+                    info['powered_by'] = resp.headers.get('X-Powered-By')
+                    info['headers']    = dict(resp.headers)
+
+                    sec = {}
+                    for h in ['Strict-Transport-Security', 'X-Frame-Options',
+                              'X-Content-Type-Options', 'Content-Security-Policy',
+                              'X-XSS-Protection', 'Referrer-Policy']:
+                        if h in resp.headers:
+                            sec[h] = resp.headers[h]
+                    info['security_headers'] = sec
+
+                    body       = await resp.text(errors='replace')
+                    info['body'] = body[:4096]
+
+                    try:
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(body[:2048], 'html.parser')
+                        if soup.title and soup.title.string:
+                            info['title'] = soup.title.string.strip()[:100]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return info
+
+    # ── SAN domains ──────────────────────────────────────────────────────
+    async def _get_san_domains(self, ip: str) -> List[str]:
+        domains: List[str] = []
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _fetch():
+                ctx = ssl.create_default_context()
+                with socket.create_connection((ip, 443), timeout=TIMEOUT_TCP) as s:
+                    with ctx.wrap_socket(s, server_hostname=ip) as ss:
+                        return ss.getpeercert()
+
+            cert = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch), timeout=TIMEOUT_TCP
+            )
+            if 'subjectAltName' in cert:
+                for tag, val in cert['subjectAltName']:
+                    if tag == 'DNS':
+                        d = val.replace('*.', '')
+                        if d not in domains:
+                            domains.append(d)
+            if 'subject' in cert:
+                for rdn in cert['subject']:
+                    for name, val in rdn:
+                        if name == 'commonName':
+                            d = val.replace('*.', '')
+                            if d not in domains:
+                                domains.append(d)
+        except Exception:
+            pass
+        return domains[:15]
+
+    # ── Technology detection ─────────────────────────────────────────────
+    def _detect_technologies(self, html: str, headers: Dict) -> List[str]:
+        tech = []
+        h    = html.lower()
+        if 'wp-content' in h or 'wp-includes' in h: tech.append('WordPress')
+        if 'joomla'  in h:                          tech.append('Joomla')
+        if 'drupal'  in h:                          tech.append('Drupal')
+        if 'data-reactroot' in h or 'react' in h:  tech.append('React')
+        if 'ng-app'  in h or 'angular' in h:       tech.append('Angular')
+        if 'vue'     in h:                          tech.append('Vue.js')
+        if 'jquery'  in h:                          tech.append('jQuery')
+        if 'bootstrap' in h:                        tech.append('Bootstrap')
+        pb = headers.get('X-Powered-By', '').lower()
+        sv = headers.get('Server',       '').lower()
+        if 'php'     in pb or 'php'     in sv: tech.append('PHP')
+        if 'asp.net' in pb or 'asp.net' in sv: tech.append('ASP.NET')
+        if 'express' in pb:                    tech.append('Express')
+        return tech
 
 
+# ─────────────────────────────────────────────
+#  RATE LIMITER
+# ─────────────────────────────────────────────
 class RateLimiter:
-    """Thread-safe rate limiter"""
-    
-    def __init__(self, requests_per_second: float = 10.0):
-        self.requests_per_second = requests_per_second
-        self.min_interval = 1.0 / requests_per_second
-        self.last_request = 0
-        self.lock = threading.Lock()
-    
+    def __init__(self, rps: float = 8.0):
+        self._interval    = 1.0 / rps
+        self._last        = 0.0
+        self._lock        = threading.Lock()
+
     def wait(self):
-        """Wait with jitter"""
-        with self.lock:
-            now = time.time()
-            elapsed = now - self.last_request
-            
-            if elapsed < self.min_interval:
-                jitter = random.uniform(0, self.min_interval * 0.3)
-                sleep_time = (self.min_interval - elapsed) + jitter
-                time.sleep(sleep_time)
-            
-            self.last_request = time.time()
+        with self._lock:
+            now     = time.time()
+            elapsed = now - self._last
+            if elapsed < self._interval:
+                jitter = random.uniform(0, self._interval * 0.25)
+                time.sleep(self._interval - elapsed + jitter)
+            self._last = time.time()
 
 
-class MultiKeywordIPGenerator:
-    """Multi-keyword IP generator with parallel processing"""
-    
-    def __init__(self, rate_limiter: RateLimiter):
-        self.rate_limiter = rate_limiter
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.ip_counter = 0
-        self.counter_lock = threading.Lock()
-    
-    def generate_ips_multi_keyword(self, keywords: List[str], target_count: int, 
-                                   country_code: Optional[str] = None) -> Tuple[Set[str], Dict[str, int]]:
-        """Generate IPs from multiple keywords in parallel"""
-        unique_ips = set()
-        source_stats = defaultdict(int)
-        ips_lock = threading.Lock()
-        
-        print(f"\n{Colors.BOLD}=== IP GENERATION ==={Colors.ENDC}\n")
-        print(f"{Colors.BLUE}Requested IPs: {target_count}{Colors.ENDC}")
-        print(f"{Colors.BLUE}Keywords: {', '.join(keywords)}{Colors.ENDC}")
-        
-        if country_code:
-            print(f"{Colors.BLUE}Target Country: {country_code.upper()}{Colors.ENDC}")
-        else:
-            print(f"{Colors.BLUE}Target: Worldwide{Colors.ENDC}")
-        
-        print()
-        
-        # Calculate per-keyword target
-        per_keyword = max(10, target_count // len(keywords))
-        
-        def process_keyword(keyword):
-            """Process single keyword"""
-            keyword_ips = set()
-            
-            # DNS discovery
+# ─────────────────────────────────────────────
+#  MULTI-SOURCE IP GENERATOR
+# ─────────────────────────────────────────────
+class MultiSourceIPGenerator:
+
+    def __init__(self, rate_limiter: RateLimiter, config: DataSourceConfig):
+        self._rl     = rate_limiter
+        self._cfg    = config
+        self._sess   = requests.Session()
+        self._sess.headers.update({'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        )})
+        self.ip_counter  = 0
+        self._cnt_lock   = threading.Lock()
+        self._set_lock   = threading.Lock()
+
+    # ── Public entry ────────────────────────────────────────────────────
+    def generate(self, keywords: List[str], target: int,
+                 country: Optional[str] = None) -> Tuple[Set[str], Dict[str, int]]:
+        unique: Set[str]      = set()
+        stats:  Dict[str, int] = defaultdict(int)
+
+        per_kw = max(10, target // len(keywords))
+
+        def _process(kw: str):
+            found: Set[str] = set()
+
+            def _add(ips: Set[str], source: str):
+                with self._set_lock:
+                    new = ips - unique
+                if new:
+                    with self._cnt_lock:
+                        self.ip_counter += len(new)
+                    with self._set_lock:
+                        unique.update(new)
+                    stats[source] = stats.get(source, 0) + len(new)
+                    print(f"  {Colors.GREEN}{source}{Colors.ENDC}: "
+                          f"+{len(new)} (Total: {self.ip_counter})")
+
+            # DNS
             try:
-                dns_ips = self._discover_dns_ips(keyword, per_keyword, country_code)
-                keyword_ips.update(dns_ips)
-                self._update_progress(len(dns_ips), 'DNS', ips_lock, unique_ips, dns_ips)
-            except:
+                _add(self._dns(kw, per_kw, country), 'DNS')
+            except Exception:
                 pass
-            
-            # URLScan
+
+            # URLScan (free)
             try:
-                self.rate_limiter.wait()
-                urlscan_ips = self._search_urlscan_ips(keyword, per_keyword, country_code)
-                keyword_ips.update(urlscan_ips)
-                self._update_progress(len(urlscan_ips), 'URLScan', ips_lock, unique_ips, urlscan_ips)
-            except:
+                self._rl.wait()
+                _add(self._urlscan(kw, per_kw, country), 'URLScan')
+            except Exception:
                 pass
-            
-            # ThreatCrowd
+
+            # ThreatCrowd (free)
             try:
-                self.rate_limiter.wait()
-                threat_ips = self._search_threatcrowd_ips(keyword, per_keyword)
-                keyword_ips.update(threat_ips)
-                self._update_progress(len(threat_ips), 'ThreatCrowd', ips_lock, unique_ips, threat_ips)
-            except:
+                self._rl.wait()
+                _add(self._threatcrowd(kw, per_kw), 'ThreatCrowd')
+            except Exception:
                 pass
-            
-            return keyword_ips
-        
-        # Parallel processing
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(keywords)) as executor:
-            futures = {executor.submit(process_keyword, kw): kw for kw in keywords}
-            
-            for future in concurrent.futures.as_completed(futures):
-                keyword = futures[future]
+
+            # Shodan
+            if self._cfg.has_shodan():
                 try:
-                    keyword_ips = future.result()
-                    with ips_lock:
-                        new_ips = keyword_ips - unique_ips
-                        unique_ips.update(new_ips)
-                        source_stats[keyword] = len(keyword_ips)
-                except:
+                    self._rl.wait()
+                    _add(self._shodan(kw, per_kw, country), 'Shodan')
+                except Exception:
                     pass
-        
-        # Filter by country if needed
-        if country_code and unique_ips:
-            print(f"\n{Colors.CYAN}Filtering by country: {country_code.upper()}...{Colors.ENDC}")
-            filtered = self._filter_by_country(unique_ips, country_code)
-            print(f"{Colors.GREEN}{len(filtered)} IPs match target country{Colors.ENDC}")
-            return filtered, dict(source_stats)
-        
-        return unique_ips, dict(source_stats)
-    
-    def _update_progress(self, count: int, source: str, lock, unique_ips: Set, new_ips: Set):
-        """Thread-safe progress update"""
-        with lock:
-            added = new_ips - unique_ips
-            if added:
-                with self.counter_lock:
-                    self.ip_counter += len(added)
-                print(f"  {source}: +{len(added)} IPs (Total: {self.ip_counter})")
-    
-    def _filter_by_country(self, ips: Set[str], country_code: str) -> Set[str]:
-        """Filter IPs by country"""
-        filtered = set()
-        country_upper = country_code.upper()
-        
-        for ip in list(ips)[:200]:  # Limit to avoid rate limiting
-            try:
-                self.rate_limiter.wait()
-                url = f"http://ip-api.com/json/{ip}?fields=countryCode"
-                response = self.session.get(url, timeout=5)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('countryCode', '').upper() == country_upper:
-                        filtered.add(ip)
-            except:
-                pass
-        
-        return filtered
-    
-    def _discover_dns_ips(self, keyword: str, limit: int, country_code: Optional[str]) -> Set[str]:
-        """DNS discovery"""
-        ips = set()
-        
-        tlds = ['com', 'net', 'org', 'io', 'ai', 'dev']
-        
-        if country_code:
-            country_tlds = {
-                'US': ['us'],
-                'UK': ['uk', 'co.uk'],
-                'RU': ['ru'],
-                'CA': ['ca'],
-                'AU': ['au'],
-                'DE': ['de'],
-                'FR': ['fr'],
+
+            # Censys
+            if self._cfg.has_censys():
+                try:
+                    self._rl.wait()
+                    _add(self._censys(kw, per_kw, country), 'Censys')
+                except Exception:
+                    pass
+
+            # FOFA
+            if self._cfg.has_fofa():
+                try:
+                    self._rl.wait()
+                    _add(self._fofa(kw, per_kw, country), 'FOFA')
+                except Exception:
+                    pass
+
+            # ZoomEye
+            if self._cfg.has_zoomeye():
+                try:
+                    self._rl.wait()
+                    _add(self._zoomeye(kw, per_kw, country), 'ZoomEye')
+                except Exception:
+                    pass
+
+            # SecurityTrails
+            if self._cfg.has_securitytrails():
+                try:
+                    self._rl.wait()
+                    _add(self._securitytrails(kw, per_kw), 'SecurityTrails')
+                except Exception:
+                    pass
+
+            return found
+
+        workers = min(len(keywords), 5)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_process, kw) for kw in keywords]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        return unique, dict(stats)
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+    def _ok(self, ip: str) -> bool:
+        try:
+            parts = ip.split('.')
+            if len(parts) != 4:
+                return False
+            nums = list(map(int, parts))
+            if not all(0 <= n <= 255 for n in nums):
+                return False
+            # Private ranges
+            if nums[0] == 10: return False
+            if nums[0] == 172 and 16 <= nums[1] <= 31: return False
+            if nums[0] == 192 and nums[1] == 168: return False
+            if nums[0] in (0, 127): return False
+            return True
+        except Exception:
+            return False
+
+    # ── DNS ──────────────────────────────────────────────────────────────
+    def _dns(self, kw: str, limit: int, country: Optional[str]) -> Set[str]:
+        ips: Set[str] = set()
+        tlds = ['com', 'net', 'org', 'io', 'ai', 'dev', 'app']
+        if country:
+            extras = {
+                'US': ['us'], 'UK': ['uk', 'co.uk'], 'RU': ['ru'],
+                'CA': ['ca'], 'AU': ['au'], 'DE': ['de'], 'FR': ['fr'],
+                'IN': ['in'], 'BR': ['br'],
             }
-            tlds = country_tlds.get(country_code.upper(), []) + tlds[:3]
-        
-        subdomains = ['www', 'mail', 'api', 'app']
-        
-        patterns = []
-        for tld in tlds[:5]:
-            patterns.append(f"{keyword}.{tld}")
-            for sub in subdomains[:2]:
-                patterns.append(f"{sub}.{keyword}.{tld}")
-        
-        for pattern in patterns[:30]:
+            tlds = extras.get(country.upper(), []) + tlds
+
+        patterns = [kw]
+        for tld in tlds[:6]:
+            patterns.append(f"{kw}.{tld}")
+            for sub in ['www', 'mail', 'api', 'app', 'admin']:
+                patterns.append(f"{sub}.{kw}.{tld}")
+
+        for pat in patterns[:35]:
             if len(ips) >= limit:
                 break
-            
             try:
-                ip = socket.gethostbyname(pattern)
-                if self._is_valid_ip(ip) and not self._is_private_ip(ip):
+                ip = socket.gethostbyname(pat)
+                if self._ok(ip):
                     ips.add(ip)
-            except:
+            except Exception:
                 pass
-            
-            time.sleep(0.03)
-        
+            time.sleep(0.02)
         return ips
-    
-    def _search_urlscan_ips(self, keyword: str, limit: int, country_code: Optional[str]) -> Set[str]:
-        """URLScan search"""
-        ips = set()
-        
+
+    # ── URLScan ──────────────────────────────────────────────────────────
+    def _urlscan(self, kw: str, limit: int, country: Optional[str]) -> Set[str]:
+        ips: Set[str] = set()
         try:
-            url = "https://urlscan.io/api/v1/search/"
-            
-            if country_code:
-                query = f'domain:{keyword} country:{country_code.upper()}'
-            else:
-                query = f'domain:{keyword}'
-            
-            params = {'q': query, 'size': min(100, limit * 2)}
-            
-            response = self.session.get(url, params=params, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for result in data.get('results', []):
-                    page = result.get('page', {})
-                    ip = page.get('ip', '')
-                    
-                    if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
+            q = f'domain:{kw}' + (f' country:{country.upper()}' if country else '')
+            r = self._sess.get(
+                'https://urlscan.io/api/v1/search/',
+                params={'q': q, 'size': min(100, limit * 2)},
+                timeout=15
+            )
+            if r.status_code == 200:
+                for item in r.json().get('results', []):
+                    ip = item.get('page', {}).get('ip', '')
+                    if ip and self._ok(ip):
                         ips.add(ip)
                         if len(ips) >= limit:
                             break
-        except:
+        except Exception:
             pass
-        
         return ips
-    
-    def _search_threatcrowd_ips(self, keyword: str, limit: int) -> Set[str]:
-        """ThreatCrowd search"""
-        ips = set()
-        
+
+    # ── ThreatCrowd ──────────────────────────────────────────────────────
+    def _threatcrowd(self, kw: str, limit: int) -> Set[str]:
+        ips: Set[str] = set()
         try:
-            url = f"https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={keyword}"
-            response = self.session.get(url, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
+            r = self._sess.get(
+                f'https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={kw}',
+                timeout=15
+            )
+            if r.status_code == 200:
+                data = r.json()
                 if data.get('response_code') == '1':
-                    for resolution in data.get('resolutions', []):
-                        ip = resolution.get('ip_address', '')
-                        if ip and self._is_valid_ip(ip) and not self._is_private_ip(ip):
+                    for res in data.get('resolutions', []):
+                        ip = res.get('ip_address', '')
+                        if ip and self._ok(ip):
                             ips.add(ip)
                             if len(ips) >= limit:
                                 break
-        except:
+        except Exception:
             pass
-        
         return ips
-    
-    def _is_valid_ip(self, ip: str) -> bool:
-        """Validate IP"""
+
+    # ── Shodan ───────────────────────────────────────────────────────────
+    def _shodan(self, kw: str, limit: int, country: Optional[str]) -> Set[str]:
+        ips: Set[str] = set()
         try:
-            pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-            if re.match(pattern, ip):
-                parts = ip.split('.')
-                return all(0 <= int(part) <= 255 for part in parts)
-        except:
+            key   = self._cfg.api_keys.get('shodan_api_key', '')
+            query = f'hostname:{kw}' + (f' country:{country.upper()}' if country else '')
+            r = self._sess.get(
+                'https://api.shodan.io/shodan/host/search',
+                params={'key': key, 'query': query, 'limit': min(100, limit)},
+                timeout=15
+            )
+            if r.status_code == 200:
+                for m in r.json().get('matches', []):
+                    ip = m.get('ip_str', '')
+                    if ip and self._ok(ip):
+                        ips.add(ip)
+                        if len(ips) >= limit:
+                            break
+        except Exception:
             pass
-        return False
-    
-    def _is_private_ip(self, ip: str) -> bool:
-        """Check private IP"""
+        return ips
+
+    # ── Censys ───────────────────────────────────────────────────────────
+    def _censys(self, kw: str, limit: int, country: Optional[str]) -> Set[str]:
+        ips: Set[str] = set()
         try:
-            parts = list(map(int, ip.split('.')))
-            
-            if parts[0] == 10:
-                return True
-            if parts[0] == 172 and 16 <= parts[1] <= 31:
-                return True
-            if parts[0] == 192 and parts[1] == 168:
-                return True
-            if parts[0] == 127 or parts[0] == 0:
-                return True
-        except:
+            api_id  = self._cfg.api_keys.get('censys_api_id', '')
+            api_sec = self._cfg.api_keys.get('censys_api_secret', '')
+            q = f'services.http.response.html_title:{kw}'
+            if country:
+                q += f' AND location.country_code:{country.upper()}'
+            r = self._sess.post(
+                'https://search.censys.io/api/v2/hosts/search',
+                json={'q': q, 'per_page': min(100, limit)},
+                auth=(api_id, api_sec),
+                headers={'Accept': 'application/json'},
+                timeout=15
+            )
+            if r.status_code == 200:
+                for hit in r.json().get('result', {}).get('hits', []):
+                    ip = hit.get('ip', '')
+                    if ip and self._ok(ip):
+                        ips.add(ip)
+                        if len(ips) >= limit:
+                            break
+        except Exception:
             pass
-        
-        return False
+        return ips
+
+    # ── FOFA ─────────────────────────────────────────────────────────────
+    def _fofa(self, kw: str, limit: int, country: Optional[str]) -> Set[str]:
+        ips: Set[str] = set()
+        try:
+            email = self._cfg.api_keys.get('fofa_email', '')
+            key   = self._cfg.api_keys.get('fofa_key',   '')
+            q     = f'domain="{kw}"'
+            if country:
+                q += f' && country="{country.upper()}"'
+            q_b64 = base64.b64encode(q.encode()).decode()
+            r = self._sess.get(
+                'https://fofa.info/api/v1/search/all',
+                params={'email': email, 'key': key,
+                        'qbase64': q_b64, 'size': min(100, limit), 'fields': 'ip'},
+                timeout=15
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if not d.get('error', True):
+                    for row in d.get('results', []):
+                        ip = row[0] if row else ''
+                        if ip and self._ok(ip):
+                            ips.add(ip)
+                            if len(ips) >= limit:
+                                break
+        except Exception:
+            pass
+        return ips
+
+    # ── ZoomEye ──────────────────────────────────────────────────────────
+    def _zoomeye(self, kw: str, limit: int, country: Optional[str]) -> Set[str]:
+        ips: Set[str] = set()
+        try:
+            key   = self._cfg.api_keys.get('zoomeye_api_key', '')
+            query = f'hostname:{kw}' + (f' +country:{country.upper()}' if country else '')
+            r = self._sess.get(
+                'https://api.zoomeye.org/host/search',
+                headers={'API-KEY': key},
+                params={'query': query, 'page': 1},
+                timeout=15
+            )
+            if r.status_code == 200:
+                for m in r.json().get('matches', []):
+                    ip = m.get('ip', '')
+                    if ip and self._ok(ip):
+                        ips.add(ip)
+                        if len(ips) >= limit:
+                            break
+        except Exception:
+            pass
+        return ips
+
+    # ── SecurityTrails ───────────────────────────────────────────────────
+    def _securitytrails(self, kw: str, limit: int) -> Set[str]:
+        ips: Set[str] = set()
+        try:
+            key = self._cfg.api_keys.get('securitytrails_api_key', '')
+            r   = self._sess.get(
+                f'https://api.securitytrails.com/v1/domain/{kw}',
+                headers={'APIKEY': key, 'Accept': 'application/json'},
+                timeout=15
+            )
+            if r.status_code == 200:
+                for rec in r.json().get('current_dns', {}).get('a', {}).get('values', []):
+                    ip = rec.get('ip', '')
+                    if ip and self._ok(ip):
+                        ips.add(ip)
+                        if len(ips) >= limit:
+                            break
+        except Exception:
+            pass
+        return ips
 
 
+# ─────────────────────────────────────────────
+#  CLI
+# ─────────────────────────────────────────────
 class SpiderWebCLI:
-    """SpiderWeb CLI"""
-    
-    VERSION = "7.0"
-    BANNER = f"""
-{Colors.BOLD}{Colors.GREEN}╔═══════════════════════════════════════════════════════════════════╗
-║                                                                   ║
-║         ╔═╗┌─┐┬┌┬┐┌─┐┬─┐╦ ╦┌─┐┌┐     ╔═╗╦═╗╔═╗                    ║
-║         ╚═╗├─┘│ ││├┤ ├┬┘║║║├┤ ├┴┐    ╠═╝╠╦╝║ ║                    ║
-║         ╚═╝┴  ┴─┴┘└─┘┴└─╚╩╝└─┘└─┘    ╩  ╩╚═╚═╝                    ║
-║                                                                   ║
-║{Colors.ENDC}       {Colors.RED}Professional IP Analysis v{VERSION} - Origin Detection{Colors.ENDC}         {Colors.GREEN}   ║
-║{Colors.ENDC}                        {Colors.WHITE}by g33l0{Colors.ENDC}                                   {Colors.GREEN}    ║
-║                                                                   ║
-║   ┌─────────────────────────────────────────────────────────┐     ║
-║   │  Scan | Worldwide | CDN Bypass | Advanced Detection     │     ║
-║   └─────────────────────────────────────────────────────────┘     ║
-╚═══════════════════════════════════════════════════════════════════╝{Colors.ENDC}
-"""
-    
-    MAX_IPS = 4000
-    REQUESTS_PER_SECOND = 8.0
-    
-    def __init__(self, verbose: bool = True):
-        self.verbose = verbose
-        self.results: List[IPAnalysisResult] = []
-        
-        self.rate_limiter = RateLimiter(self.REQUESTS_PER_SECOND)
-        self.ip_generator = MultiKeywordIPGenerator(self.rate_limiter)
-        self.scanner = AdvancedScanner(self.rate_limiter)
-        
-        signal.signal(signal.SIGINT, self._signal_handler)
-    
-    def _signal_handler(self, sig, frame):
-        """Handle Ctrl+C"""
-        print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.ENDC}")
+
+    VERSION = "2.2"
+
+    BANNER = (
+        f"{Colors.BOLD}{Colors.GREEN}"
+        "╔═════════════════════════════════════════════════════════════════╗\n"
+        "║                                                                 ║\n"
+        "║         ╔═╗┌─┐┬┌┬┐┌─┐┬─┐╦ ╦┌─┐┌┐     ╔═╗╦═╗╔═╗                  ║\n"
+        "║         ╚═╗├─┘│ ││├┤ ├┬┘║║║├┤ ├┴┐    ╠═╝╠╦╝║ ║                  ║\n"
+        "║         ╚═╝┴  ┴─┴┘└─┘┴└─╚╩╝└─┘└─┘    ╩  ╩╚═╚═╝                  ║\n"
+        "║                                                                 ║\n"
+        f"║{Colors.ENDC}       {Colors.RED}Professional IP Analysis v8.2 - Enterprise Edition{Colors.ENDC}"
+        f"        {Colors.GREEN}║\n"
+        f"║{Colors.ENDC}                        {Colors.WHITE}by g33l0{Colors.ENDC}"
+        f"                                 {Colors.GREEN}║\n"
+        "║                                                                 ║\n"
+        "║   ┌─────────────────────────────────────────────────────────┐   ║\n"
+        "║   │  Multi-Source Intelligence | CDN-Aware Classification   │   ║\n"
+        "║   │  Shodan | Censys | FOFA | ZoomEye | SecurityTrails      │   ║\n"
+        "║   └─────────────────────────────────────────────────────────┘   ║\n"
+        f"╚═════════════════════════════════════════════════════════════════╝{Colors.ENDC}"
+    )
+
+    MAX_IPS = 5000
+
+    def __init__(self):
+        self.results:  List[IPAnalysisResult] = []
+        self._rl       = RateLimiter(8.0)
+        self.config    = DataSourceConfig()
+        self.generator = MultiSourceIPGenerator(self._rl, self.config)
+        signal.signal(signal.SIGINT, self._on_ctrl_c)
+
+    def _on_ctrl_c(self, sig, frame):
+        print(f"\n{Colors.YELLOW}Cancelled.{Colors.ENDC}")
         sys.exit(0)
-    
+
+    # ── Banner ────────────────────────────────────────────────────────────
     def print_banner(self):
-        """Display banner"""
         print(self.BANNER)
-    
-    def log(self, message: str, level: str = "INFO"):
-        """Logging"""
-        if not self.verbose:
-            return
-        
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        colors = {
-            "INFO": Colors.BLUE,
-            "SUCCESS": Colors.GREEN,
-            "ERROR": Colors.RED,
-            "WARNING": Colors.YELLOW,
-        }
-        
-        color = colors.get(level, Colors.WHITE)
-        print(f"{color}[{timestamp}] {message}{Colors.ENDC}")
-    
+
+    # ── Input helper ─────────────────────────────────────────────────────
     def get_input(self, prompt: str, allow_back: bool = True) -> str:
-        """Get user input with navigation"""
-        nav = " (ESC=Exit"
-        if allow_back:
-            nav += ", 0=Back"
-        nav += ")"
-        
-        full_prompt = f"{prompt}{Colors.BOLD}{nav}: {Colors.ENDC}"
-        
+        nav = " (ESC=Exit" + (", 0=Back" if allow_back else "") + ")"
         try:
-            user_input = input(full_prompt).strip()
-            
-            if user_input.upper() == 'ESC' or user_input == '\x1b':
+            val = input(f"{prompt}{Colors.BOLD}{nav}: {Colors.ENDC}").strip()
+            if val.upper() == 'ESC':
                 raise ExitException()
-            
-            if user_input == '0' and allow_back:
+            if val == '0' and allow_back:
                 raise NavigationException()
-            
-            return user_input
-        
+            return val
         except (KeyboardInterrupt, EOFError):
             raise ExitException()
-    
+
+    # ── Menus ─────────────────────────────────────────────────────────────
     def prompt_input_method(self) -> str:
-        """Input method selection"""
         while True:
             try:
                 print(f"\n{Colors.BOLD}=== SELECT INPUT METHOD ==={Colors.ENDC}\n")
-                print(f"{Colors.CYAN}1.{Colors.ENDC} Keyword-based IP generation")
-                print(f"{Colors.CYAN}2.{Colors.ENDC} Scan IPs from file (ips.txt)")
-                
-                choice = self.get_input("\nEnter choice (1 or 2)", allow_back=False)
-                
-                if choice == "1":
-                    return "keyword"
-                elif choice == "2":
-                    return "file"
-                else:
-                    print(f"{Colors.RED}Invalid choice.{Colors.ENDC}")
-            
-            except NavigationException:
-                continue
+                print(f"{Colors.CYAN}1.{Colors.ENDC} Keyword-based IP generation (Multi-source)")
+                print(f"{Colors.CYAN}2.{Colors.ENDC} Scan IPs from file  (ips.txt)")
+                print(f"{Colors.CYAN}3.{Colors.ENDC} Configure API Keys")
+                choice = self.get_input("Choice (1-3)", False)
+                if choice == "1": return "keyword"
+                if choice == "2": return "file"
+                if choice == "3":
+                    self._configure_api_keys()
+                    continue
+                print(f"{Colors.RED}Invalid choice.{Colors.ENDC}")
             except ExitException:
                 sys.exit(0)
-    
+
+    def _configure_api_keys(self):
+        print(f"\n{Colors.BOLD}=== API CONFIGURATION ==={Colors.ENDC}\n")
+        print(f"{Colors.YELLOW}Press Enter to skip any source.{Colors.ENDC}\n")
+        try:
+            fields = [
+                ('Shodan API Key',        'shodan_api_key'),
+                ('Censys API ID',         'censys_api_id'),
+                ('Censys API Secret',     'censys_api_secret'),
+                ('FOFA Email',            'fofa_email'),
+                ('FOFA API Key',          'fofa_key'),
+                ('ZoomEye API Key',       'zoomeye_api_key'),
+                ('SecurityTrails API Key','securitytrails_api_key'),
+            ]
+            for label, key in fields:
+                val = input(f"{label}: ").strip()
+                if val:
+                    self.config.api_keys[key] = val
+            self.config.save()
+            print(f"\n{Colors.GREEN}Configuration saved to spiderweb_config.json{Colors.ENDC}\n")
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{Colors.YELLOW}Configuration cancelled.{Colors.ENDC}")
+
     def get_country_input(self) -> Optional[str]:
-        """Get country code"""
+        """0 = back, 00 = worldwide, XX = country code."""
         while True:
             try:
                 print(f"\n{Colors.BOLD}=== TARGET LOCATION ==={Colors.ENDC}\n")
-                print(f"{Colors.CYAN}Enter country code or 0 for worldwide{Colors.ENDC}")
-                print(f"\n{Colors.BOLD}Popular:{Colors.ENDC}")
-                print("  US - United States    UK - United Kingdom    CA - Canada")
-                print("  AU - Australia        DE - Germany           FR - France")
-                print("  JP - Japan            CN - China             IN - India")
-                print("  BR - Brazil           RU - Russia            ZA - South Africa")
-                
-                country = self.get_input("\nCountry code", allow_back=True).upper()
-                
+                print(f"{Colors.CYAN}Enter 2-letter country code, 00 for worldwide, or 0 to go back.{Colors.ENDC}")
+                print(f"\n{Colors.BOLD}Examples:{Colors.ENDC}")
+                print("  US  UK  CA  AU  DE  FR  JP  CN  IN  BR  RU  ZA")
+                country = self.get_input("Country code (or 00 for worldwide)", False).upper()
                 if country == "0":
+                    raise NavigationException()
+                if country == "00":
                     return None
-                
                 if len(country) == 2 and country.isalpha():
                     return country
-                else:
-                    print(f"{Colors.RED}Invalid code. Use 2 letters (e.g., US).{Colors.ENDC}")
-            
+                print(f"{Colors.RED}Invalid. Use 2 letters, 00 for worldwide, or 0 to go back.{Colors.ENDC}")
             except NavigationException:
                 raise
-    
+
     def get_keyword_input(self) -> Tuple[List[str], int, Optional[str]]:
-        """Get keywords, count, and country"""
         while True:
             try:
-                print(f"\n{Colors.BOLD}=== KEYWORD-BASED IP GENERATION ==={Colors.ENDC}\n")
-                
-                # Keywords
-                keywords_input = self.get_input("Enter keywords (comma-separated)", allow_back=True)
-                
-                if not keywords_input:
-                    print(f"{Colors.RED}Keywords cannot be empty.{Colors.ENDC}")
-                    continue
-                
-                keywords = [k.strip() for k in keywords_input.split(',') if k.strip()]
-                
+                print(f"\n{Colors.BOLD}=== KEYWORD-BASED GENERATION ==={Colors.ENDC}\n")
+                raw = self.get_input("Keywords (comma-separated)", True)
+                keywords = [k.strip() for k in raw.split(',') if k.strip()]
                 if not keywords:
-                    print(f"{Colors.RED}Please enter at least one keyword.{Colors.ENDC}")
+                    print(f"{Colors.RED}At least one keyword required.{Colors.ENDC}")
                     continue
-                
-                # Count
-                while True:
-                    try:
-                        count_input = self.get_input(f"How many IPs? (max {self.MAX_IPS})", allow_back=True)
-                        count = int(count_input)
-                        
-                        if count <= 0:
-                            print(f"{Colors.RED}Must be greater than 0.{Colors.ENDC}")
-                            continue
-                        
-                        if count > self.MAX_IPS:
-                            print(f"{Colors.RED}Maximum is {self.MAX_IPS}.{Colors.ENDC}")
-                            continue
-                        
-                        break
-                    
-                    except ValueError:
-                        print(f"{Colors.RED}Invalid number.{Colors.ENDC}")
-                    except NavigationException:
-                        raise
-                
-                # Country
+
+                count_str = self.get_input(f"How many IPs? (max {self.MAX_IPS})", True)
+                try:
+                    count = int(count_str)
+                except ValueError:
+                    print(f"{Colors.RED}Invalid number.{Colors.ENDC}")
+                    continue
+
+                if not 1 <= count <= self.MAX_IPS:
+                    print(f"{Colors.RED}Must be 1-{self.MAX_IPS}.{Colors.ENDC}")
+                    continue
+
                 country = self.get_country_input()
-                
                 return keywords, count, country
-            
             except NavigationException:
                 continue
-    
-    def read_ips_from_file(self, filename: str = "ips.txt") -> List[str]:
-        """Read IPs from file"""
-        filepath = Path(filename)
-        
-        if not filepath.exists():
-            self.log(f"File '{filename}' not found", "ERROR")
+
+    def read_ips_from_file(self) -> List[str]:
+        fp = Path("ips.txt")
+        if not fp.exists():
+            print(f"{Colors.RED}'ips.txt' not found in {os.getcwd()}{Colors.ENDC}")
             raise NavigationException()
-        
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(fp, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            
             ips = []
-            for line in lines:
+            for n, line in enumerate(lines, 1):
                 ip = line.strip()
-                
                 if not ip or ip.startswith('#'):
                     continue
-                
-                if self.is_valid_ip(ip):
+                if self._valid_ip(ip):
                     ips.append(ip)
-            
+                else:
+                    print(f"{Colors.YELLOW}Line {n}: skipped invalid IP '{ip}'{Colors.ENDC}")
             if not ips:
-                self.log("No valid IPs found", "ERROR")
+                print(f"{Colors.RED}No valid IPs found.{Colors.ENDC}")
                 raise NavigationException()
-            
             unique = list(dict.fromkeys(ips))
-            
+            removed = len(ips) - len(unique)
+            if removed:
+                print(f"{Colors.YELLOW}Removed {removed} duplicate IPs.{Colors.ENDC}")
             if len(unique) > self.MAX_IPS:
+                print(f"{Colors.YELLOW}Trimmed to {self.MAX_IPS} IPs.{Colors.ENDC}")
                 unique = unique[:self.MAX_IPS]
-            
-            self.log(f"Loaded {len(unique)} IPs", "SUCCESS")
             return unique
-        
         except Exception as e:
-            self.log(f"Error: {str(e)}", "ERROR")
+            print(f"{Colors.RED}Error reading file: {e}{Colors.ENDC}")
             raise NavigationException()
-    
-    def is_valid_ip(self, ip: str) -> bool:
-        """Validate IP"""
+
+    @staticmethod
+    def _valid_ip(ip: str) -> bool:
         try:
-            pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-            if re.match(pattern, ip):
-                parts = ip.split('.')
-                return all(0 <= int(part) <= 255 for part in parts)
-        except:
-            pass
-        return False
-    
-    def batch_scan(self, ips: List[str], keywords: List[str] = None, country_code: Optional[str] = None):
-        """Batch scan with advanced detection"""
-        
-        randomized = ips.copy()
-        random.shuffle(randomized)
-        
-        self.log(f"Starting scan of {len(randomized)} IPs", "INFO")
-        
-        print(f"\n{Colors.BOLD}=== ADVANCED SCANNING ==={Colors.ENDC}\n")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            futures = {executor.submit(self.scanner.comprehensive_scan, ip, keywords, country_code): ip 
-                      for ip in randomized}
-            
-            completed = 0
-            total = len(randomized)
-            
-            for future in concurrent.futures.as_completed(futures):
-                ip = futures[future]
-                try:
-                    result = future.result()
-                    self.results.append(result)
-                    
-                    completed += 1
-                    progress = completed / total * 100
-                    bar_length = 30
-                    filled = int(bar_length * completed / total)
-                    bar = '█' * filled + '░' * (bar_length - filled)
-                    
-                    print(f"\r{Colors.CYAN}[{bar}] {progress:.1f}%{Colors.ENDC} | "
-                          f"Scanned: {completed}/{total}", end='', flush=True)
-                
-                except Exception:
-                    self.results.append(IPAnalysisResult(ip=ip))
-        
+            parts = ip.split('.')
+            return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+        except Exception:
+            return False
+
+    # ── Batch scan ────────────────────────────────────────────────────────
+    async def _async_scan(self, ips: List[str],
+                          keywords: List[str],
+                          country:  Optional[str]):
+        print(f"\n{Colors.BOLD}=== SCANNING {len(ips)} IPs ==={Colors.ENDC}\n")
+        scanner = AsyncScanner()
+        await scanner.init_session()
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+        async def _run(ip):
+            async with sem:
+                return await scanner.scan_ip(ip, keywords, country)
+
+        tasks     = [_run(ip) for ip in ips]
+        completed = 0
+        total     = len(ips)
+
+        try:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                self.results.append(result)
+                completed += 1
+                pct   = completed / total * 100
+                filled = int(30 * completed / total)
+                bar   = '█' * filled + '░' * (30 - filled)
+                print(f"\r{Colors.CYAN}[{bar}] {pct:.1f}%{Colors.ENDC} | {completed}/{total}",
+                      end='', flush=True)
+        finally:
+            await scanner.close_session()
+
         print(f"\n\n{Colors.BOLD}=== SCAN COMPLETE ==={Colors.ENDC}\n")
-        self.log(f"Scanned {len(self.results)} IPs", "SUCCESS")
-    
+
+    def batch_scan(self, ips: List[str],
+                   keywords: List[str] = None,
+                   country:  Optional[str] = None):
+        try:
+            asyncio.run(self._async_scan(ips, keywords or [], country))
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}Scan interrupted.{Colors.ENDC}")
+
+    # ── Display ───────────────────────────────────────────────────────────
     def display_results(self):
-        """Display results"""
         if not self.results:
-            self.log("No results", "WARNING")
+            print(f"{Colors.YELLOW}No results.{Colors.ENDC}")
             return
-        
-        alive = [r for r in self.results if r.liveness.status in ["alive", "tls_only"]]
-        origin = [r for r in alive if r.hosting.is_origin]
-        cdn = [r for r in alive if r.is_cdn]
-        dead = [r for r in self.results if r.liveness.status == "dead"]
-        
+
+        by_cat:  Dict[str, list] = defaultdict(list)
+        by_risk: Dict[str, list] = defaultdict(list)
+        dead = []
+
+        for r in self.results:
+            if r.liveness.status == "dead":
+                dead.append(r)
+            else:
+                by_cat[r.hosting.category].append(r)
+                if r.vulnerability.risk_level not in ("MINIMAL", "LOW"):
+                    by_risk[r.vulnerability.risk_level].append(r)
+
+        alive     = sum(len(v) for v in by_cat.values())
+        origin_ct = sum(len(v) for k, v in by_cat.items() if k != "CDN_EDGE")
+        cdn_ct    = len(by_cat.get("CDN_EDGE", []))
+        vuln_ct   = sum(len(v) for v in by_risk.values())
+
         print(f"\n{Colors.BOLD}{'='*80}{Colors.ENDC}")
-        print(f"{Colors.BOLD}{'RESULTS SUMMARY':^80}{Colors.ENDC}")
+        print(f"{Colors.BOLD}{'SECURITY ASSESSMENT RESULTS':^80}{Colors.ENDC}")
         print(f"{Colors.BOLD}{'='*80}{Colors.ENDC}\n")
-        
-        print(f"{Colors.GREEN}Origin Servers: {len(origin)}{Colors.ENDC}")
-        print(f"{Colors.YELLOW}CDN/Proxies: {len(cdn)}{Colors.ENDC}")
-        print(f"{Colors.CYAN}Total Alive: {len(alive)}{Colors.ENDC}")
-        print(f"{Colors.RED}Dead: {len(dead)}{Colors.ENDC}\n")
-        
-        if origin:
+
+        print(f"  {Colors.GREEN}Total Alive     : {alive}{Colors.ENDC}")
+        print(f"  {Colors.GREEN}  Origin Servers : {origin_ct}{Colors.ENDC}")
+        print(f"  {Colors.YELLOW}  CDN / Proxies  : {cdn_ct}{Colors.ENDC}")
+        print(f"  {Colors.RED}Dead / Filtered : {len(dead)}{Colors.ENDC}")
+        print(f"  {Colors.MAGENTA}Vulnerable Targets: {vuln_ct}{Colors.ENDC}")
+        print(f"  {Colors.BLUE}Total Scanned   : {len(self.results)}{Colors.ENDC}\n")
+
+        # Vulnerability section (origin only)
+        if by_risk:
             print(f"{Colors.BOLD}{'─'*80}{Colors.ENDC}")
-            print(f"{Colors.BOLD}ORIGIN SERVERS (Top 15){Colors.ENDC}")
+            print(f"{Colors.BOLD}{Colors.RED}ORIGIN SERVER VULNERABILITY ASSESSMENT{Colors.ENDC}")
             print(f"{Colors.BOLD}{'─'*80}{Colors.ENDC}\n")
-            
-            for idx, r in enumerate(origin[:15], 1):
-                print(f"{Colors.GREEN}[{idx}] {r.ip}{Colors.ENDC} | {r.hosting.hosting_type.upper()}")
-                print(f"    Status: {r.liveness.status.upper()} | Confidence: {r.confidence_score}")
-                
-                if r.country_name:
-                    print(f"    Location: {r.city or 'Unknown'}, {r.country_name}")
-                
-                if r.domains.all_domains:
-                    domains_str = ', '.join(r.domains.all_domains[:3])
-                    if len(r.domains.all_domains) > 3:
-                        domains_str += f" +{len(r.domains.all_domains)-3} more"
-                    print(f"    Domains: {domains_str}")
-                
+
+            for level in ('CRITICAL', 'HIGH', 'MEDIUM'):
+                targets = by_risk.get(level, [])
+                if not targets:
+                    continue
+                clr = Colors.RED if level == 'CRITICAL' else Colors.YELLOW
+                print(f"{clr}{level}: {len(targets)} target(s){Colors.ENDC}\n")
+                for idx, r in enumerate(targets[:5], 1):
+                    print(f"{clr}[{idx}] {r.ip}{Colors.ENDC} | Risk Score: {r.vulnerability.risk_score:.1f}/10")
+                    if r.country_name:
+                        print(f"    Location  : {r.city or 'Unknown'}, {r.country_name}")
+                    if r.vulnerability.vulnerable_services:
+                        print(f"    Exposed Services:")
+                        for svc in r.vulnerability.vulnerable_services[:4]:
+                            print(f"      • {svc}")
+                    if r.vulnerability.recommendations:
+                        print(f"    Recommendations:")
+                        for rec in r.vulnerability.recommendations[:3]:
+                            print(f"      • {rec}")
+                    print()
+                if len(targets) > 5:
+                    print(f"{Colors.YELLOW}  ... and {len(targets)-5} more{Colors.ENDC}\n")
+
+        # Hosting categories
+        cat_order = ['CDN_EDGE', 'CLOUD_FRONTEND', 'CLOUD_COMPUTE',
+                     'MANAGED_HOSTING', 'SHARED_HOSTING', 'DEDICATED_VPS', 'UNKNOWN']
+        print(f"{Colors.BOLD}{'─'*80}{Colors.ENDC}")
+        print(f"{Colors.BOLD}HOSTING CLASSIFICATION{Colors.ENDC}")
+        print(f"{Colors.BOLD}{'─'*80}{Colors.ENDC}\n")
+
+        for cat in cat_order:
+            items = by_cat.get(cat, [])
+            if not items:
+                continue
+
+            cat_label = cat.replace('_', ' ')
+            print(f"{Colors.BOLD}{cat_label}: {len(items)}{Colors.ENDC}\n")
+
+            for idx, r in enumerate(items[:5], 1):
+                risk_icon = ('!' if r.vulnerability.risk_level == 'CRITICAL' else
+                             '^' if r.vulnerability.risk_level == 'HIGH' else '-')
+                print(f"  {Colors.GREEN}[{idx}] {r.ip}{Colors.ENDC} [{risk_icon}] | "
+                      f"Conf: {r.hosting.confidence:.2f}")
+
                 if r.hosting.provider:
-                    print(f"    Provider: {r.hosting.provider}")
-                
+                    print(f"      Provider       : {r.hosting.provider}")
+                if r.country_name:
+                    print(f"      Location       : {r.city or 'N/A'}, {r.country_name} ({r.country})")
+                if r.isp:
+                    print(f"      ISP            : {r.isp}")
+                if r.asn:
+                    print(f"      ASN            : {r.asn}")
                 if r.tcp_ports_open:
-                    print(f"    Ports: {', '.join(map(str, r.tcp_ports_open[:5]))}")
-                
+                    print(f"      Open Ports     : {', '.join(map(str, r.tcp_ports_open[:10]))}")
+                if r.liveness.http_status or r.liveness.https_status:
+                    print(f"      HTTP / HTTPS   : {r.liveness.http_status or 'N/A'} / {r.liveness.https_status or 'N/A'}")
+                if r.liveness.response_time:
+                    print(f"      Response Time  : {r.liveness.response_time*1000:.1f} ms")
+                if r.domains.all_domains:
+                    ds = ', '.join(r.domains.all_domains[:4])
+                    more = f" +{len(r.domains.all_domains)-4}" if len(r.domains.all_domains) > 4 else ""
+                    print(f"      Domains        : {ds}{more}")
+                elif r.domains.reverse_dns:
+                    print(f"      Reverse DNS    : {r.domains.reverse_dns}")
+                if r.ssl.valid:
+                    print(f"      SSL            : {r.ssl.version} | Issuer: {r.ssl.issuer}")
+                if r.web.server:
+                    print(f"      Server         : {r.web.server}")
+                if r.web.title:
+                    print(f"      Title          : {r.web.title}")
+                if r.detected_technologies:
+                    print(f"      Tech Stack     : {', '.join(r.detected_technologies[:5])}")
+                if r.web.security_headers:
+                    print(f"      Sec Headers    : {len(r.web.security_headers)} present")
+
+                # CDN origin discovery paths (professional language)
+                if r.hosting.is_cdn and r.hosting.origin_discovery_paths:
+                    print(f"      {Colors.CYAN}Origin Discovery Paths:{Colors.ENDC}")
+                    for path in r.hosting.origin_discovery_paths[:3]:
+                        print(f"        > {path}")
+
                 print()
-    
+
+            if len(items) > 5:
+                print(f"  {Colors.YELLOW}... and {len(items)-5} more{Colors.ENDC}\n")
+
+    # ── Export ────────────────────────────────────────────────────────────
     def export_results(self):
-        """Export results"""
         if not self.results:
+            print(f"{Colors.YELLOW}No results to export.{Colors.ENDC}")
             return
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        json_file = f"spiderweb_{timestamp}.json"
-        csv_file = f"spiderweb_{timestamp}.csv"
-        
-        self.export_json(json_file)
-        self.export_csv(csv_file)
-        
-        print(f"\n{Colors.BOLD}=== EXPORT COMPLETE ==={Colors.ENDC}\n")
-        print(f"{Colors.GREEN}JSON: {json_file}{Colors.ENDC}")
-        print(f"{Colors.GREEN}CSV: {csv_file}{Colors.ENDC}\n")
-    
-    def export_json(self, filename: str):
-        """Export JSON"""
-        output = {
-            'metadata': {
-                'tool': 'SpiderWeb Pro',
-                'version': self.VERSION,
-                'author': 'g33l0',
-                'timestamp': datetime.now().isoformat(),
-                'total': len(self.results)
-            },
-            'results': [asdict(r) for r in self.results]
-        }
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(output, f, indent=2)
-    
-    def export_csv(self, filename: str):
-        """Export CSV"""
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['ip', 'status', 'hosting_type', 'is_origin', 'confidence', 
-                         'domains', 'country', 'city', 'provider', 'asn']
-            
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            
+
+        ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
+        scan_id = self.results[0].scan_id if self.results else hashlib.md5(
+            str(time.time()).encode()
+        ).hexdigest()[:8]
+
+        out_dir = Path("spiderweb_results")
+        out_dir.mkdir(exist_ok=True)
+
+        # ── JSON ────────────────────────────────────────────────────────
+        json_path = out_dir / f"scan_{ts}_{scan_id}.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'metadata': {
+                    'tool':            'SpiderWeb Pro',
+                    'version':         self.VERSION,
+                    'author':          'g33l0',
+                    'scan_id':         scan_id,
+                    'timestamp':       datetime.now().isoformat(),
+                    'total_scanned':   len(self.results),
+                    'total_alive':     sum(1 for r in self.results if r.liveness.status != 'dead'),
+                    'total_vulnerable':sum(1 for r in self.results
+                                          if r.vulnerability.risk_level in ('CRITICAL','HIGH','MEDIUM')),
+                },
+                'results': [asdict(r) for r in self.results],
+            }, f, indent=2, ensure_ascii=False)
+
+        # ── CSV ─────────────────────────────────────────────────────────
+        csv_path = out_dir / f"scan_{ts}_{scan_id}.csv"
+        fieldnames = [
+            'ip', 'status', 'category', 'confidence', 'is_origin', 'is_cdn', 'provider',
+            'country', 'city', 'region', 'isp', 'asn', 'organization',
+            'open_ports', 'http_status', 'https_status', 'response_time_ms',
+            'reverse_dns', 'domains', 'ssl_valid', 'ssl_version', 'ssl_issuer', 'ssl_expiry',
+            'web_server', 'web_title', 'powered_by', 'technologies',
+            'risk_level', 'risk_score', 'vulnerable_services', 'recommendations',
+            'origin_discovery_paths', 'scan_timestamp',
+        ]
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
             for r in self.results:
-                writer.writerow({
-                    'ip': r.ip,
-                    'status': r.liveness.status,
-                    'hosting_type': r.hosting.hosting_type,
-                    'is_origin': r.hosting.is_origin,
-                    'confidence': r.confidence_score,
-                    'domains': ','.join(r.domains.all_domains[:5]),
-                    'country': r.country or '',
-                    'city': r.city or '',
-                    'provider': r.hosting.provider or '',
-                    'asn': r.asn or ''
+                w.writerow({
+                    'ip':                   r.ip,
+                    'status':               r.liveness.status,
+                    'category':             r.hosting.category,
+                    'confidence':           round(r.hosting.confidence, 3),
+                    'is_origin':            r.hosting.is_origin,
+                    'is_cdn':               r.hosting.is_cdn,
+                    'provider':             r.hosting.provider or '',
+                    'country':              r.country or '',
+                    'city':                 r.city or '',
+                    'region':               r.region or '',
+                    'isp':                  r.isp or '',
+                    'asn':                  r.asn or '',
+                    'organization':         r.organization or '',
+                    'open_ports':           ','.join(map(str, r.tcp_ports_open)),
+                    'http_status':          r.liveness.http_status or '',
+                    'https_status':         r.liveness.https_status or '',
+                    'response_time_ms':     (round(r.liveness.response_time * 1000, 2)
+                                             if r.liveness.response_time else ''),
+                    'reverse_dns':          r.domains.reverse_dns or '',
+                    'domains':              ','.join(r.domains.all_domains),
+                    'ssl_valid':            r.ssl.valid,
+                    'ssl_version':          r.ssl.version or '',
+                    'ssl_issuer':           r.ssl.issuer or '',
+                    'ssl_expiry':           r.ssl.expiry or '',
+                    'web_server':           r.web.server or '',
+                    'web_title':            r.web.title or '',
+                    'powered_by':           r.web.powered_by or '',
+                    'technologies':         ','.join(r.detected_technologies),
+                    'risk_level':           r.vulnerability.risk_level,
+                    'risk_score':           r.vulnerability.risk_score,
+                    'vulnerable_services':  '; '.join(r.vulnerability.vulnerable_services),
+                    'recommendations':      '; '.join(r.vulnerability.recommendations),
+                    'origin_discovery_paths': '; '.join(r.hosting.origin_discovery_paths),
+                    'scan_timestamp':       r.scan_timestamp,
                 })
 
+        # ── Vulnerability TXT (origin only) ─────────────────────────────
+        high_risk = [r for r in self.results
+                     if r.vulnerability.risk_level in ('CRITICAL', 'HIGH')
+                     and not r.hosting.is_cdn]
 
+        vuln_path = None
+        if high_risk:
+            vuln_path = out_dir / f"vulnerable_{ts}_{scan_id}.txt"
+            with open(vuln_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("SPIDERWEB PRO - ORIGIN SERVER VULNERABILITY REPORT\n")
+                f.write(f"Scan ID   : {scan_id}\n")
+                f.write(f"Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("Note      : Only confirmed origin servers included.\n")
+                f.write("           CDN edge nodes are excluded from this report.\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"HIGH-RISK ORIGIN SERVERS: {len(high_risk)}\n\n")
+                for r in high_risk:
+                    f.write(f"\nIP         : {r.ip}\n")
+                    f.write(f"Risk Level : {r.vulnerability.risk_level}\n")
+                    f.write(f"Risk Score : {r.vulnerability.risk_score:.1f}/10\n")
+                    f.write(f"Category   : {r.hosting.category}\n")
+                    f.write(f"Provider   : {r.hosting.provider or 'Unknown'}\n")
+                    f.write(f"Location   : {r.city}, {r.country_name}\n")
+                    if r.vulnerability.vulnerable_services:
+                        f.write("Vulnerable Services:\n")
+                        for svc in r.vulnerability.vulnerable_services:
+                            f.write(f"  - {svc}\n")
+                    if r.vulnerability.recommendations:
+                        f.write("Recommendations:\n")
+                        for rec in r.vulnerability.recommendations:
+                            f.write(f"  - {rec}\n")
+                    f.write("\n" + "-" * 80 + "\n")
+
+        # Print summary
+        print(f"\n{Colors.BOLD}=== EXPORT COMPLETE ==={Colors.ENDC}\n")
+        print(f"  {Colors.GREEN}Directory : {out_dir}{Colors.ENDC}")
+        print(f"  {Colors.GREEN}JSON      : {json_path.name}{Colors.ENDC}")
+        print(f"  {Colors.GREEN}CSV       : {csv_path.name}{Colors.ENDC}")
+        if vuln_path:
+            print(f"  {Colors.RED}Vuln TXT  : {vuln_path.name}{Colors.ENDC}")
+        print(f"\n  {Colors.CYAN}Scan ID   : {scan_id}{Colors.ENDC}\n")
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 def main():
-    """Main entry"""
+    # Ensure dependencies
     try:
-        from bs4 import BeautifulSoup
+        from bs4 import BeautifulSoup  # noqa: F401
+        import aiohttp                 # noqa: F401
     except ImportError:
+        print(f"{Colors.CYAN}Installing required packages...{Colors.ENDC}")
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4", "-q"])
-    
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "beautifulsoup4", "aiohttp", "-q"]
+        )
+        print(f"{Colors.GREEN}Done.{Colors.ENDC}\n")
+
     try:
         import urllib3
         urllib3.disable_warnings()
-    except:
+    except Exception:
         pass
-    
+
     cli = SpiderWebCLI()
     cli.print_banner()
-    
+    print(f"{Colors.YELLOW}LEGAL: Use only on systems you are authorized to test.{Colors.ENDC}\n")
+
     while True:
         try:
             method = cli.prompt_input_method()
-            
-            ips = []
-            keywords = None
-            country = None
-            
+
+            ips:      List[str]     = []
+            keywords: List[str]     = []
+            country:  Optional[str] = None
+
+            # ── Keyword mode ─────────────────────────────────────────────
             if method == "keyword":
-                keywords, target_count, country = cli.get_keyword_input()
-                
-                # Reset counter
-                cli.ip_generator.ip_counter = 0
-                
-                generated, stats = cli.ip_generator.generate_ips_multi_keyword(keywords, target_count, country)
+                keywords, count, country = cli.get_keyword_input()
+                cli.generator.ip_counter = 0
+
+                # Animated spinner during generation
+                spinner = Spinner("Generating IPs, Please wait")
+                spinner.start()
+                generated, stats = cli.generator.generate(keywords, count, country)
+                spinner.stop()
+
                 ips = list(generated)
-                
-                print(f"\n{Colors.BOLD}=== GENERATION REPORT ==={Colors.ENDC}\n")
-                print(f"{Colors.BLUE}Requested: {target_count}{Colors.ENDC}")
-                print(f"{Colors.GREEN}Generated: {len(ips)}{Colors.ENDC}\n")
-                
-                if len(ips) < target_count:
-                    print(f"{Colors.YELLOW}WARNING: Generated {len(ips)}/{target_count} IPs{Colors.ENDC}\n")
-                    
-                    if len(ips) > 0:
-                        proceed = cli.get_input(f"Proceed with {len(ips)} IPs? (y/n)", True).lower()
-                        if proceed != 'y':
-                            continue
-                    else:
-                        print(f"{Colors.RED}No IPs generated.{Colors.ENDC}")
+
+                print(f"\n{Colors.BOLD}=== GENERATION SUMMARY ==={Colors.ENDC}\n")
+                print(f"  {Colors.BLUE}Requested : {count}{Colors.ENDC}")
+                print(f"  {Colors.GREEN}Generated : {len(ips)}{Colors.ENDC}")
+
+                if stats:
+                    print(f"\n  {Colors.BOLD}Source Breakdown:{Colors.ENDC}")
+                    for src, cnt in sorted(stats.items(), key=lambda x: -x[1]):
+                        print(f"    {src:20s}: {cnt}")
+                print()
+
+                if len(ips) == 0:
+                    print(f"{Colors.RED}No IPs generated. Try different keywords or add API keys.{Colors.ENDC}")
+                    continue
+
+                if len(ips) < count:
+                    print(f"{Colors.YELLOW}Generated {len(ips)}/{count} IPs. Proceeding with available.{Colors.ENDC}\n")
+                    proceed = cli.get_input(f"Continue with {len(ips)} IPs? (y/n)", True).lower()
+                    if proceed != 'y':
                         continue
-            
-            elif method == "file":
-                ips = cli.read_ips_from_file("ips.txt")
-                print(f"\n{Colors.GREEN}Loaded {len(ips)} IPs{Colors.ENDC}\n")
-            
-            confirm = cli.get_input(f"Scan {len(ips)} IPs? (y/n)", True).lower()
-            
+
+            # ── File mode ────────────────────────────────────────────────
+            else:
+                ips = cli.read_ips_from_file()
+                print(f"\n{Colors.GREEN}Loaded {len(ips)} IPs from ips.txt{Colors.ENDC}\n")
+
+            # ── Scan confirmation ────────────────────────────────────────
+            confirm = cli.get_input(f"Start scan of {len(ips)} IPs? (y/n)", True).lower()
             if confirm != 'y':
                 continue
-            
+
+            cli.results = []  # Fresh results per scan session
             cli.batch_scan(ips, keywords, country)
             cli.display_results()
-            
+
+            # ── Export ───────────────────────────────────────────────────
             if cli.results:
-                export = cli.get_input("Export? (y/n)", True).lower()
-                if export == 'y':
+                if cli.get_input("Export results? (y/n)", True).lower() == 'y':
                     cli.export_results()
-            
-            print(f"\n{Colors.GREEN}Scan complete!{Colors.ENDC}\n")
-            
-            another = cli.get_input("Another scan? (y/n)", False).lower()
-            if another != 'y':
-                print(f"\n{Colors.WHITE}Thank you! Goodbye.{Colors.ENDC}\n")
+
+            print(f"\n{Colors.GREEN}Assessment complete.{Colors.ENDC}\n")
+
+            if cli.get_input("Run another scan? (y/n)", False).lower() != 'y':
+                print(f"\n{Colors.WHITE}Thank you for using SpiderWeb Pro. Stay secure!{Colors.ENDC}\n")
                 break
-        
+
         except NavigationException:
             continue
         except ExitException:
-            print(f"\n{Colors.WHITE}Goodbye!{Colors.ENDC}")
+            print(f"\n{Colors.WHITE}Goodbye!{Colors.ENDC}\n")
             break
+        except Exception as e:
+            print(f"\n{Colors.RED}Unexpected error: {e}{Colors.ENDC}")
+            import traceback
+            traceback.print_exc()
+            try:
+                if cli.get_input("Retry? (y/n)", False).lower() != 'y':
+                    break
+            except Exception:
+                break
+
+    print(f"{Colors.CYAN}SpiderWeb Pro v{SpiderWebCLI.VERSION} closed.{Colors.ENDC}\n")
 
 
 if __name__ == "__main__":
