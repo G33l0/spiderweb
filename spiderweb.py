@@ -1499,7 +1499,7 @@ class SpiderWebCLI:
         "║         ╚═╗├─┘│ ││├┤ ├┬┘║║║├┤ ├┴┐    ╠═╝╠╦╝║ ║                  ║\n"
         "║         ╚═╝┴  ┴─┴┘└─┘┴└─╚╩╝└─┘└─┘    ╩  ╩╚═╚═╝                  ║\n"
         "║                                                                 ║\n"
-        f"║{Colors.ENDC}       {Colors.RED}Professional IP Analysis v8.2 - Enterprise Edition{Colors.ENDC}"
+        f"║{Colors.ENDC}       {Colors.RED}Professional IP Analysis v2.2 - Enterprise Edition{Colors.ENDC}"
         f"        {Colors.GREEN}║\n"
         f"║{Colors.ENDC}                        {Colors.WHITE}by g33l0{Colors.ENDC}"
         f"                                 {Colors.GREEN}║\n"
@@ -2071,3 +2071,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
