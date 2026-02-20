@@ -1,15 +1,16 @@
-# SpiderWeb Pro - Python Dependencies
 
 # Install with: pip install -r requirements.txt
 
 # HTTP/Async requests
 
 requests>=2.31.0
+
 aiohttp>=3.9.0
 
 # HTML/XML parsing
 
 beautifulsoup4>=4.12.0
+
 lxml>=4.9.0
 
 # Optional: Enhanced functionality
@@ -18,22 +19,22 @@ lxml>=4.9.0
 
 # MySQL testing (for aggressive mode)
 
-# mysql-connector-python>=8.2.0
+mysql-connector-python>=8.2.0
 
 # PostgreSQL testing (for aggressive mode)
 
-# psycopg2-binary>=2.9.0
+psycopg2-binary>=2.9.0
 
 # MongoDB testing (for aggressive mode)
 
-# pymongo>=4.6.0
+pymongo>=4.6.0
 
 # Redis testing (for aggressive mode)
 
-# redis>=5.0.0
+redis>=5.0.0
 
 # Git repository dumping (for aggressive mode)
 
-# git-dumper>=1.0.0
+git-dumper>=1.0.0
 
 dnspython>=2.4.0
