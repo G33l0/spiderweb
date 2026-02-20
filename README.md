@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-users%20ready-brightgreen.svg)]()
+[![Status](https://img.shields.io/badge/status-Active%20-brightgreen.svg)]()
 
 > Professional security intelligence platform with automated vulnerability assessment and red team attack chain analysis.
 
@@ -19,7 +19,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/github/spiderweb.git
+git clone https://github.com/g33l0/spiderweb.git
 cd spiderweb
 
 # Install dependencies
