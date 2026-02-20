@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-production%20ready-brightgreen.svg)]()
+[![Status](https://img.shields.io/badge/status-users%20ready-brightgreen.svg)]()
 
 > Professional security intelligence platform with automated vulnerability assessment and red team attack chain analysis.
 
@@ -212,13 +212,6 @@ API keys are stored in `spiderweb_config.json`:
 }
 ```
 
-## 📈 Performance
-
-- **Concurrent Scanning**: 120 simultaneous connections
-- **Rate Limiting**: 8 requests/second to avoid detection
-- **Smart Caching**: ASN and reverse DNS results cached
-- **Efficient Targeting**: Analyzes only top 5 high-risk findings for Red Team
-
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -246,7 +239,9 @@ This tool is for authorized security testing only. Users are responsible for com
 
 ## 📧 Contact
 
-**Author:** @g33l0 [![Telegram](https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg)](https://t.me/x0x0h33l0)
+**Author:** @g33l0 <a href="https://t.me/x0x0h33l0">
+  <img src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg" width="16" alt="Telegram">
+</a>
 **Version:** 2.4 + Red Team Automation
 
 -----
