@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 G33l0
+Copyright (c) 2026 g33l0
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,24 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+LEGAL NOTICE & DISCLAIMER:
+
+This tool is intended for authorized security testing and research purposes only.
+Users must:
+
+1. Obtain explicit written authorization before testing any systems
+2. Comply with all applicable laws and regulations
+3. Respect the rights and privacy of others
+4. Use the tool responsibly and ethically
+
+The authors and contributors assume no liability for:
+- Unauthorized use of this tool
+- Damage caused by misuse
+- Legal consequences resulting from improper use
+- Any violations of laws or regulations
+
+By using this software, you agree to use it only on systems you are authorized
+to test and accept full responsibility for your actions.
