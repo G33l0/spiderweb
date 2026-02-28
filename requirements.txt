@@ -1,40 +1,26 @@
-
 # Install with: pip install -r requirements.txt
 
-# HTTP/Async requests
-
+# ── Core (required) ───────────────────────────────────────────────────────────
+# Synchronous HTTP — IP/domain generation, WHOIS, CVE lookups, API sources
 requests>=2.31.0
 
+# Async HTTP — all concurrent scanning (port enrichment, SSL, web fingerprint)
 aiohttp>=3.9.0
 
-# HTML/XML parsing
-
+# HTML parsing — page title extraction, technology detection
+# Uses Python's built-in html.parser; lxml is NOT required
 beautifulsoup4>=4.12.0
 
-lxml>=4.9.0
-
-# Optional: Enhanced functionality
-
-# Uncomment if you want these features
-
-# MySQL testing (for aggressive mode)
-
-mysql-connector-python>=8.2.0
-
-# PostgreSQL testing (for aggressive mode)
-
-psycopg2-binary>=2.9.0
-
-# MongoDB testing (for aggressive mode)
-
-pymongo>=4.6.0
-
-# Redis testing (for aggressive mode)
-
-redis>=5.0.0
-
-# Git repository dumping (for aggressive mode)
-
-git-dumper>=1.0.0
-
+# ── Optional (gracefully skipped if absent) ───────────────────────────────────
+# DNS record resolution — SMTP SPF / DKIM / DMARC checks in Domain Recon mode
+# Without this, SMTP DNS checks are silently skipped; all other features work
 dnspython>=2.4.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOT needed — the tool uses raw asyncio sockets for all service probing:
+#   mysql-connector-python  (MySQL tested via raw TCP)
+#   psycopg2-binary         (PostgreSQL tested via raw TCP)
+#   pymongo                 (MongoDB tested via raw TCP)
+#   redis                   (Redis tested via raw TCP)
+#   git-dumper              (git recon uses HTTP path checks, not git-dumper)
+#   lxml                    (BeautifulSoup uses html.parser, not lxml)
